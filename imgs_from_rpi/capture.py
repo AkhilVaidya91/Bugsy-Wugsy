@@ -4,11 +4,22 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from libcamera import controls
 from picamera2 import Picamera2
 
 
 def send(path: Path, dest: str) -> None:
     subprocess.run(["scp", "-q", str(path), dest], check=True)
+
+
+def focus(cam: Picamera2) -> float | None:
+    """Run one AF cycle in the current (fast) mode. Return lens position or None."""
+    cam.set_controls({"AfMode": controls.AfModeEnum.Auto,
+                      "AfRange": controls.AfRangeEnum.Normal})
+    ok = cam.autofocus_cycle()  # blocks until the cycle finishes
+    lens = cam.capture_metadata().get("LensPosition")
+    print(f"AF {'ok' if ok else 'FAILED'}, lens position {lens}")
+    return lens if ok else None
 
 
 def main() -> None:
@@ -24,15 +35,27 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cam = Picamera2()
-    cam.configure(cam.create_still_configuration())
+    # Small main stream makes libcamera pick a fast binned sensor mode for AF
+    preview_cfg = cam.create_preview_configuration(main={"size": (2312, 1736)})
+    cam.configure(preview_cfg)
     cam.start()
-    time.sleep(5.0)  # let auto exposure / white balance settle
+    time.sleep(2.0)  # let AE/AWB settle
 
     try:
         for i in range(args.count):
+            lens = focus(cam)
+
+            # Lock the focus found above for the full-res capture
+            still_controls = {}
+            if lens is not None:
+                still_controls = {"AfMode": controls.AfModeEnum.Manual,
+                                  "LensPosition": lens}
+            still_cfg = cam.create_still_configuration(controls=still_controls)
+
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             path = out_dir / f"img_{stamp}.jpg"
-            cam.capture_file(str(path))
+            # switches to full res, captures, then returns to preview mode
+            cam.switch_mode_and_capture_file(still_cfg, str(path))
             print(f"saved {path}")
 
             if args.dest:
