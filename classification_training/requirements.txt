@@ -1,6 +1,9 @@
-numpy
-pandas
-Pillow
-scikit-learn
 torch
 torchvision
+numpy
+Pillow
+scikit-learn
+matplotlib
+onnx
+onnxscript
+onnxruntime

@@ -1,659 +1,741 @@
-# python bug_classifier_compare.py \
-#   --csv data/bug_crops.csv \
-#   --output-dir runs/bug_classifier_comparison \
-#   --warmup-epochs 3 \
-#   --finetune-epochs 15 \
-#   --batch-size 16
 
-import argparse
+from __future__ import annotations
+
 import json
+import math
+import random
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torchvision import models, transforms
 from torchvision.models import (
-    VGG16_Weights,
-    MobileNet_V3_Small_Weights,
+    efficientnet_v2_m,
+    EfficientNet_V2_M_Weights,
 )
 
 from sklearn.metrics import (
     accuracy_score,
-    balanced_accuracy_score,
-    f1_score,
     classification_report,
     confusion_matrix,
+    f1_score,
 )
-from sklearn.model_selection import StratifiedGroupKFold
+import matplotlib.pyplot as plt
 
 
-CLASSES = ["1", "2", "3", "other"]
-MEAN = (0.485, 0.456, 0.406)
-STD = (0.229, 0.224, 0.225)
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent
+OUTPUT_DIR = ROOT / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+CLASS_NAMES = ["1", "2", "3", "Insect"]
+NUM_CLASSES = len(CLASS_NAMES)
+
+IMAGE_SIZE = 224
+BATCH_SIZE = 4
+HEAD_ONLY_EPOCHS = 3
+FINETUNE_EPOCHS = 17
+TOTAL_EPOCHS = HEAD_ONLY_EPOCHS + FINETUNE_EPOCHS
+
+HEAD_LR = 1e-3
+BACKBONE_LR = 1e-5
+WEIGHT_DECAY = 1e-4
+DROPOUT = 0.35
+
+BBOX_MARGIN = 0.05
+NUM_WORKERS = 0  # Reliable default on macOS
+
+SEED = 42
+
+# Numeric feature normalization.
+LOG_AREA_DIVISOR = 20.0
+
+# Standard ImageNet normalization for the selected weights.
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def split_grouped(df):
-    """Keep crops from the same source photograph in one split."""
+# ============================================================
+# REPRODUCIBILITY AND DEVICE
+# ============================================================
 
-    outer = StratifiedGroupKFold(
-        n_splits=5, shuffle=True, random_state=42
+def set_seed(seed: int = SEED) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def get_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        print("Using Apple Metal Performance Shaders (MPS).")
+        return torch.device("mps")
+
+    print("MPS unavailable. Using CPU.")
+    return torch.device("cpu")
+
+
+# ============================================================
+# IMAGE PREPROCESSING
+# ============================================================
+
+def square_resize(image: Image.Image) -> Image.Image:
+    """
+    Preserve aspect ratio, pad to a square, then resize to 224x224.
+    """
+    image = image.convert("RGB")
+
+    return ImageOps.pad(
+        image,
+        (IMAGE_SIZE, IMAGE_SIZE),
+        method=Image.Resampling.BILINEAR,
+        color=(0, 0, 0),
+        centering=(0.5, 0.5),
     )
 
-    train_val_idx, test_idx = next(
-        outer.split(
-            df,
-            df.label_id,
-            groups=df.source_image_id,
-        )
-    )
 
-    train_val = df.iloc[train_val_idx].copy().reset_index(drop=True)
-    test = df.iloc[test_idx].copy().reset_index(drop=True)
-
-    inner = StratifiedGroupKFold(
-        n_splits=4, shuffle=True, random_state=43
-    )
-
-    train_idx, val_idx = next(
-        inner.split(
-            train_val,
-            train_val.label_id,
-            groups=train_val.source_image_id,
-        )
-    )
-
-    train = train_val.iloc[train_idx].copy().reset_index(drop=True)
-    val = train_val.iloc[val_idx].copy().reset_index(drop=True)
-
-    return train, val, test
+def image_to_tensor(image: Image.Image) -> torch.Tensor:
+    """
+    Return RGB float32 tensor in [0, 1], shape (3, 224, 224).
+    Normalization happens inside the model.
+    """
+    image = square_resize(image)
+    array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
 
 
-def load_manifest(csv_path):
-    df = pd.read_csv(csv_path)
+def augment_crop(image: Image.Image) -> Image.Image:
+    """
+    Mild augmentation for a small insect dataset.
+    Avoid aggressive geometric transformations.
+    """
+    if random.random() < 0.5:
+        image = ImageOps.mirror(image)
 
-    required = {
-        "crop_path",
-        "label",
-        "source_image_id",
-        "bbox_width",
-        "bbox_height",
-        "yolo_confidence",
-    }
-
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing CSV columns: {sorted(missing)}")
-
-    df["label"] = df["label"].astype(str).str.strip().str.lower()
-
-    unknown = sorted(set(df.label) - set(CLASSES))
-    if unknown:
-        raise ValueError(
-            f"Unknown labels {unknown}. Expected {CLASSES}."
+    if random.random() < 0.5:
+        image = ImageEnhance.Brightness(image).enhance(
+            random.uniform(0.90, 1.10)
         )
 
-    df["label_id"] = df.label.map(
-        {name: i for i, name in enumerate(CLASSES)}
-    )
-
-    df["crop_path"] = df.crop_path.map(
-        lambda p: str(
-            (
-                Path(p)
-                if Path(p).is_absolute()
-                else csv_path.parent / p
-            ).resolve()
-        )
-    )
-
-    df["bbox_width"] = pd.to_numeric(
-        df.bbox_width, errors="raise"
-    ).clip(lower=0)
-
-    df["bbox_height"] = pd.to_numeric(
-        df.bbox_height, errors="raise"
-    ).clip(lower=0)
-
-    df["yolo_confidence"] = pd.to_numeric(
-        df.yolo_confidence, errors="raise"
-    ).fillna(0)
-
-    if "aspect_ratio" not in df.columns:
-        df["aspect_ratio"] = (
-            df.bbox_width / df.bbox_height.clip(lower=1)
+    if random.random() < 0.5:
+        image = ImageEnhance.Contrast(image).enhance(
+            random.uniform(0.90, 1.10)
         )
 
-    df["aspect_ratio"] = pd.to_numeric(
-        df.aspect_ratio, errors="raise"
-    ).fillna(1).clip(lower=0)
-
-    # Log-transform box dimensions to reduce scale differences.
-    df["meta_w"] = np.log1p(df.bbox_width)
-    df["meta_h"] = np.log1p(df.bbox_height)
-    df["meta_ar"] = df.aspect_ratio
-    df["meta_conf"] = df.yolo_confidence
-
-    for path in df.crop_path:
-        if not Path(path).is_file():
-            raise FileNotFoundError(f"Crop not found: {path}")
-
-    return df
-
-
-class CropDataset(Dataset):
-    def __init__(self, df, meta_mean, meta_std, train=False):
-        self.df = df.reset_index(drop=True)
-        self.meta_mean = meta_mean
-        self.meta_std = meta_std
-
-        augmentations = []
-
-        if train:
-            augmentations = [
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(8),
-                transforms.ColorJitter(
-                    brightness=0.12,
-                    contrast=0.12,
-                ),
-            ]
-
-        self.transform = transforms.Compose(
-            augmentations
-            + [
-                transforms.ToTensor(),
-                transforms.Normalize(MEAN, STD),
-            ]
+    if random.random() < 0.5:
+        image = ImageEnhance.Color(image).enhance(
+            random.uniform(0.90, 1.10)
         )
 
-    def __len__(self):
-        return len(self.df)
+    return image
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
 
-        # Preserve aspect ratio and pad to 224 x 224.
-        with Image.open(row.crop_path) as im:
-            im = ImageOps.pad(
-                im.convert("RGB"),
-                (224, 224),
-                color=(0, 0, 0),
+# ============================================================
+# YOLO DATASET
+# ============================================================
+
+class YOLOCropDataset(Dataset):
+    """
+    Convert each YOLO bounding box into one classification sample.
+
+    Expected structure:
+        split/images/image.jpg
+        split/labels/image.txt
+
+    Each YOLO line:
+        class_id x_center y_center width height
+
+    Coordinates are normalized to [0, 1].
+    """
+
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def __init__(self, split: str, training: bool = False):
+        self.split_dir = ROOT / split
+        self.images_dir = self.split_dir / "images"
+        self.labels_dir = self.split_dir / "labels"
+        self.training = training
+
+        if not self.images_dir.is_dir():
+            raise FileNotFoundError(
+                f"Missing image directory: {self.images_dir}"
             )
 
-        image = self.transform(im)
+        if not self.labels_dir.is_dir():
+            raise FileNotFoundError(
+                f"Missing label directory: {self.labels_dir}"
+            )
 
-        metadata = np.array(
-            [
-                row.meta_w,
-                row.meta_h,
-                row.meta_ar,
-                row.meta_conf,
-            ],
-            dtype=np.float32,
+        self.samples = []
+        missing_labels = 0
+        invalid_boxes = 0
+
+        image_paths = sorted(
+            p for p in self.images_dir.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in self.IMAGE_EXTENSIONS
         )
 
-        metadata = torch.tensor(
-            (metadata - self.meta_mean) / self.meta_std,
+        for image_path in image_paths:
+            label_path = self.labels_dir / f"{image_path.stem}.txt"
+
+            if not label_path.exists():
+                missing_labels += 1
+                continue
+
+            try:
+                with Image.open(image_path) as im:
+                    image_width, image_height = im.size
+            except Exception as exc:
+                print(f"Skipping unreadable image {image_path}: {exc}")
+                continue
+
+            try:
+                lines = label_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            except Exception as exc:
+                print(f"Skipping unreadable label {label_path}: {exc}")
+                continue
+
+            for line_number, line in enumerate(lines, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split()
+
+                if len(parts) < 5:
+                    invalid_boxes += 1
+                    continue
+
+                try:
+                    class_id = int(parts[0])
+                    xc, yc, bw, bh = map(float, parts[1:5])
+                except ValueError:
+                    invalid_boxes += 1
+                    continue
+
+                if not 0 <= class_id < NUM_CLASSES:
+                    invalid_boxes += 1
+                    continue
+
+                if not all(
+                    math.isfinite(v) for v in (xc, yc, bw, bh)
+                ):
+                    invalid_boxes += 1
+                    continue
+
+                if bw <= 0 or bh <= 0:
+                    invalid_boxes += 1
+                    continue
+
+                # Convert normalized YOLO xywh to pixel xyxy.
+                x1 = (xc - bw / 2.0) * image_width
+                y1 = (yc - bh / 2.0) * image_height
+                x2 = (xc + bw / 2.0) * image_width
+                y2 = (yc + bh / 2.0) * image_height
+
+                # Clip the actual bounding box to the image.
+                x1 = max(0.0, min(x1, image_width))
+                y1 = max(0.0, min(y1, image_height))
+                x2 = max(0.0, min(x2, image_width))
+                y2 = max(0.0, min(y2, image_height))
+
+                if x2 <= x1 or y2 <= y1:
+                    invalid_boxes += 1
+                    continue
+
+                # Scale features describe the actual bbox, not
+                # the expanded crop used for visual classification.
+                box_area = (x2 - x1) * (y2 - y1)
+                image_area = float(image_width * image_height)
+                relative_area = box_area / image_area
+
+                # Expand the crop slightly to retain context.
+                margin_x = (x2 - x1) * BBOX_MARGIN
+                margin_y = (y2 - y1) * BBOX_MARGIN
+
+                crop_x1 = max(0, int(math.floor(x1 - margin_x)))
+                crop_y1 = max(0, int(math.floor(y1 - margin_y)))
+                crop_x2 = min(
+                    image_width, int(math.ceil(x2 + margin_x))
+                )
+                crop_y2 = min(
+                    image_height, int(math.ceil(y2 + margin_y))
+                )
+
+                if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                    invalid_boxes += 1
+                    continue
+
+                self.samples.append({
+                    "image_path": str(image_path),
+                    "box": (
+                        crop_x1, crop_y1, crop_x2, crop_y2
+                    ),
+                    "label": class_id,
+                    "area_pixels": float(box_area),
+                    "relative_area": float(relative_area),
+                })
+
+        print(f"\n[{split}]")
+        print(f"Images found: {len(image_paths)}")
+        print(f"Valid object crops: {len(self.samples)}")
+        print(f"Images without labels: {missing_labels}")
+        print(f"Invalid annotations: {invalid_boxes}")
+
+        counts = Counter(s["label"] for s in self.samples)
+        for class_id, name in enumerate(CLASS_NAMES):
+            print(f"  Class {class_id} ({name}): {counts[class_id]} crops")
+
+        if not self.samples:
+            raise RuntimeError(
+                f"No valid object crops found in {self.split_dir}. "
+                "Check the YOLO labels and folder structure."
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+
+        with Image.open(sample["image_path"]) as im:
+            image = im.convert("RGB")
+            image = image.crop(sample["box"])
+
+        if self.training:
+            image = augment_crop(image)
+
+        image_tensor = image_to_tensor(image)
+
+        # Two scale features:
+        # 1. log absolute area in original-image pixels
+        # 2. bbox area / original image area
+        scale_features = torch.tensor(
+            [
+                math.log1p(sample["area_pixels"])
+                / LOG_AREA_DIVISOR,
+                sample["relative_area"],
+            ],
             dtype=torch.float32,
         )
 
-        return image, metadata, int(row.label_id)
+        label = torch.tensor(
+            sample["label"], dtype=torch.long
+        )
+
+        return image_tensor, scale_features, label
 
 
-class MultiResolutionClassifier(nn.Module):
-    """
-    Extract features at five spatial scales.
-    Fuse the visual features with bounding-box metadata.
-    """
+# ============================================================
+# SCALE-AWARE EFFICIENTNETV2-M
+# ============================================================
 
-    def __init__(self, arch):
+class ScaleAwareEfficientNetV2M(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES):
         super().__init__()
-        self.arch = arch
 
-        if arch == "vgg16":
-            net = models.vgg16(
-                weights=VGG16_Weights.DEFAULT
-            )
-            self.features = net.features
+        weights = EfficientNet_V2_M_Weights.IMAGENET1K_V1
+        backbone = efficientnet_v2_m(weights=weights)
 
-            # Outputs after five VGG pooling stages.
-            self.ends = [4, 9, 16, 23, 30]
-            channels = [64, 128, 256, 512, 512]
-            self.finetune_start = 24
+        self.features = backbone.features
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
-        elif arch == "mobilenet_v3_small":
-            net = models.mobilenet_v3_small(
-                weights=MobileNet_V3_Small_Weights.DEFAULT
-            )
-            self.features = net.features
-
-            # Approximate spatial scales: 112, 56, 28, 14, 7.
-            self.ends = [0, 1, 2, 4, 9]
-            channels = [16, 16, 24, 40, 96]
-            self.finetune_start = 9
-
-        else:
-            raise ValueError(f"Unknown architecture: {arch}")
-
-        # Project each scale to a compact 64-dimensional vector.
-        self.projections = nn.ModuleList([
-            nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Flatten(),
-                nn.Linear(c, 64),
-                nn.ReLU(),
-            )
-            for c in channels
-        ])
-
-        # Four metadata features:
-        # width, height, aspect ratio, YOLO confidence.
-        self.meta_branch = nn.Sequential(
-            nn.Linear(4, 32),
-            nn.ReLU(),
-            nn.Dropout(0.15),
+        # Normalization is part of this model's forward pass.
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor(IMAGENET_STD).view(1, 3, 1, 1),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(5 * 64 + 32, 128),
-            nn.ReLU(),
-            nn.Dropout(0.35),
-            nn.Linear(128, 4),
+        visual_features = backbone.classifier[1].in_features
+        assert visual_features == 1280
+
+        self.classifier = nn.Sequential(
+            nn.Linear(visual_features + 2, 512),
+            nn.SiLU(),
+            nn.Dropout(DROPOUT),
+            nn.Linear(512, num_classes),
         )
 
-        self.freeze_backbone()
+        # Keep pretrained BatchNorm affine parameters frozen.
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
 
-    def freeze_backbone(self):
-        for p in self.features.parameters():
-            p.requires_grad = False
+        # Start by training the new head only.
+        for parameter in self.features.parameters():
+            parameter.requires_grad = False
 
-    def unfreeze_last_block(self):
-        self.freeze_backbone()
+    def train(self, mode: bool = True):
+        super().train(mode)
 
-        layers = list(self.features.children())
+        # Always freeze BatchNorm running statistics.
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.eval()
 
-        for layer in layers[self.finetune_start:]:
-            for p in layer.parameters():
-                p.requires_grad = True
+        return self
 
-    def forward(self, image, metadata):
-        x = image
-        feature_vectors = []
+    def unfreeze_backbone(self):
+        for parameter in self.features.parameters():
+            parameter.requires_grad = True
 
-        end_to_slot = {
-            end: slot
-            for slot, end in enumerate(self.ends)
-        }
+        # Re-freeze BatchNorm affine parameters.
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
 
-        for i, layer in enumerate(self.features):
-            x = layer(x)
+    def forward(
+        self,
+        images: torch.Tensor,
+        scale_features: torch.Tensor,
+    ) -> torch.Tensor:
+        # Input images are RGB float tensors in [0, 1].
+        x = (images - self.imagenet_mean) / self.imagenet_std
 
-            if i in end_to_slot:
-                slot = end_to_slot[i]
-                feature_vectors.append(
-                    self.projections[slot](x)
-                )
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, start_dim=1)
 
-        visual_features = torch.cat(
-            feature_vectors, dim=1
-        )
+        # Concatenate visual and original-scale features.
+        x = torch.cat((x, scale_features), dim=1)
 
-        metadata_features = self.meta_branch(metadata)
-
-        combined = torch.cat(
-            [visual_features, metadata_features],
-            dim=1,
-        )
-
-        return self.head(combined)
+        # Return logits, not probabilities.
+        return self.classifier(x)
 
 
+# ============================================================
+# TRAINING AND EVALUATION
+# ============================================================
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+
+    total_loss = 0.0
+    total_samples = 0
+    correct = 0
+
+    for images, scale, labels in loader:
+        images = images.to(device)
+        scale = scale.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        logits = model(images, scale)
+        loss = criterion(logits, labels)
+
+        loss.backward()
+        optimizer.step()
+
+        batch_size = labels.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+        correct += (logits.argmax(dim=1) == labels).sum().item()
+
+    return (
+        total_loss / max(total_samples, 1),
+        correct / max(total_samples, 1),
+    )
+
+
+@torch.inference_mode()
 def evaluate(model, loader, device):
     model.eval()
 
-    true_labels = []
-    predictions = []
-    probabilities = []
+    all_labels = []
+    all_predictions = []
+    all_probabilities = []
+    total_loss = 0.0
+    total_samples = 0
 
-    with torch.no_grad():
-        for images, metadata, labels in loader:
-            logits = model(
-                images.to(device),
-                metadata.to(device),
-            )
+    criterion = nn.CrossEntropyLoss()
 
-            probs = torch.softmax(
-                logits, dim=1
-            ).cpu().numpy()
+    for images, scale, labels in loader:
+        images = images.to(device)
+        scale = scale.to(device)
+        labels = labels.to(device)
 
-            probabilities.extend(probs)
-            predictions.extend(probs.argmax(axis=1))
-            true_labels.extend(labels.numpy())
+        logits = model(images, scale)
+        loss = criterion(logits, labels)
+        probabilities = torch.softmax(logits, dim=1)
+        predictions = logits.argmax(dim=1)
 
-    macro_f1 = f1_score(
-        true_labels,
-        predictions,
-        labels=list(range(4)),
-        average="macro",
-        zero_division=0,
+        batch_size = labels.size(0)
+        total_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+        all_labels.extend(labels.cpu().tolist())
+        all_predictions.extend(predictions.cpu().tolist())
+        all_probabilities.extend(probabilities.cpu().tolist())
+
+    y_true = np.asarray(all_labels)
+    y_pred = np.asarray(all_predictions)
+    y_prob = np.asarray(all_probabilities)
+
+    metrics = {
+        "loss": total_loss / max(total_samples, 1),
+        "accuracy": accuracy_score(y_true, y_pred),
+        "macro_f1": f1_score(
+            y_true, y_pred, average="macro", zero_division=0
+        ),
+        "weighted_f1": f1_score(
+            y_true, y_pred, average="weighted", zero_division=0
+        ),
+        "classification_report": classification_report(
+            y_true,
+            y_pred,
+            labels=list(range(NUM_CLASSES)),
+            target_names=CLASS_NAMES,
+            output_dict=True,
+            zero_division=0,
+        ),
+        "confusion_matrix": confusion_matrix(
+            y_true,
+            y_pred,
+            labels=list(range(NUM_CLASSES)),
+        ).tolist(),
+    }
+
+    return metrics, y_true, y_pred, y_prob
+
+
+def save_confusion_matrix(matrix, path: Path):
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    ax.imshow(matrix, interpolation="nearest")
+    ax.set(
+        xticks=np.arange(NUM_CLASSES),
+        yticks=np.arange(NUM_CLASSES),
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES,
+        xlabel="Predicted class",
+        ylabel="True class",
+        title="Test Confusion Matrix",
     )
 
-    return (
-        macro_f1,
-        np.asarray(true_labels),
-        np.asarray(predictions),
-        np.asarray(probabilities),
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+
+    for i in range(NUM_CLASSES):
+        for j in range(NUM_CLASSES):
+            ax.text(j, i, str(matrix[i, j]), ha="center", va="center")
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+# ============================================================
+# EXPORT
+# ============================================================
+
+def export_models(model, device):
+    model.eval()
+
+    pt_path = OUTPUT_DIR / "scale_aware_efficientnet_v2_m.pt"
+    onnx_path = OUTPUT_DIR / "scale_aware_efficientnet_v2_m.onnx"
+
+    checkpoint = {
+        "model_state_dict": model.cpu().state_dict(),
+        "class_names": CLASS_NAMES,
+        "num_classes": NUM_CLASSES,
+        "image_size": IMAGE_SIZE,
+        "model_name": "ScaleAwareEfficientNetV2-M",
+        "scale_feature_names": [
+            "log1p_bbox_area_pixels_div_20",
+            "bbox_area_fraction_of_original_image",
+        ],
+        "log_area_divisor": LOG_AREA_DIVISOR,
+        "bbox_margin": BBOX_MARGIN,
+        "imagenet_mean": IMAGENET_MEAN,
+        "imagenet_std": IMAGENET_STD,
+    }
+
+    torch.save(checkpoint, pt_path)
+
+    model.to(device)
+    model.eval()
+
+    # Export on CPU for compatibility with the ONNX exporter.
+    export_model = model.cpu().eval()
+
+    dummy_images = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+    dummy_scale = torch.tensor([[0.5, 0.1]], dtype=torch.float32)
+
+    # Legacy TorchScript-based exporter is used deliberately for
+    # compatibility with this model and broad ONNX tooling support.
+    torch.onnx.export(
+        export_model,
+        (dummy_images, dummy_scale),
+        str(onnx_path),
+        input_names=["images", "scale_features"],
+        output_names=["logits"],
+        dynamic_axes={
+            "images": {0: "batch_size"},
+            "scale_features": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+        },
+        opset_version=17,
+        dynamo=False,
     )
 
+    model.to(device)
 
-def train_one(
-    arch,
-    train_df,
-    val_df,
-    test_df,
-    meta_mean,
-    meta_std,
-    args,
-    out_dir,
-    device,
-):
-    model = MultiResolutionClassifier(arch).to(device)
+    print(f"\nPyTorch checkpoint saved: {pt_path}")
+    print(f"ONNX model saved: {onnx_path}")
+    print("ONNX inputs: images, scale_features")
+    print("ONNX output: logits")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    set_seed()
+
+    device = get_device()
+    print(f"Device: {device}")
+
+    train_dataset = YOLOCropDataset("train", training=True)
+    test_dataset = YOLOCropDataset("test", training=False)
 
     train_loader = DataLoader(
-        CropDataset(train_df, meta_mean, meta_std, train=True),
-        batch_size=args.batch_size,
+        train_dataset,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    val_loader = DataLoader(
-        CropDataset(val_df, meta_mean, meta_std),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
     )
 
     test_loader = DataLoader(
-        CropDataset(test_df, meta_mean, meta_std),
-        batch_size=args.batch_size,
+        test_dataset,
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
     )
 
-    # Conservative class balancing using inverse square-root frequency.
-    counts = np.bincount(
-        train_df.label_id, minlength=4
+    model = ScaleAwareEfficientNetV2M().to(device)
+
+    # Calculate class weights from training crops only.
+    counts = Counter(s["label"] for s in train_dataset.samples)
+    class_counts = torch.tensor(
+        [counts.get(i, 0) for i in range(NUM_CLASSES)],
+        dtype=torch.float32,
     )
 
-    class_weights = 1.0 / np.sqrt(
-        np.maximum(counts, 1)
-    )
-    class_weights /= class_weights.mean()
-
-    criterion = nn.CrossEntropyLoss(
-        weight=torch.tensor(
-            class_weights,
-            dtype=torch.float32,
-            device=device,
+    if (class_counts == 0).any():
+        missing = [
+            CLASS_NAMES[i]
+            for i in range(NUM_CLASSES)
+            if class_counts[i] == 0
+        ]
+        raise RuntimeError(
+            f"Training set has no examples for classes: {missing}"
         )
+
+    # Inverse-square-root weighting is less extreme than 1 / count.
+    class_weights = class_counts.rsqrt()
+    class_weights = class_weights / class_weights.mean()
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights.to(device)
     )
-
-    best_f1 = -1.0
-    best_state = None
-
-    def fit_phase(epochs, optimizer, phase):
-        nonlocal best_f1, best_state
-
-        for epoch in range(epochs):
-            model.train()
-
-            # Keep BatchNorm running statistics fixed in the backbone.
-            model.features.eval()
-
-            for images, metadata, labels in train_loader:
-                images = images.to(device)
-                metadata = metadata.to(device)
-                labels = labels.to(device)
-
-                optimizer.zero_grad(set_to_none=True)
-
-                logits = model(images, metadata)
-                loss = criterion(logits, labels)
-
-                loss.backward()
-                optimizer.step()
-
-            val_f1, _, _, _ = evaluate(
-                model, val_loader, device
-            )
-
-            print(
-                f"{arch} | {phase} | "
-                f"epoch {epoch + 1}/{epochs} | "
-                f"validation macro-F1={val_f1:.4f}"
-            )
-
-            if val_f1 > best_f1:
-                best_f1 = val_f1
-
-                best_state = {
-                    k: v.detach().cpu().clone()
-                    for k, v in model.state_dict().items()
-                }
-
-                torch.save(
-                    {
-                        "state_dict": best_state,
-                        "architecture": arch,
-                        "classes": CLASSES,
-                    },
-                    out_dir / f"{arch}_best.pt",
-                )
-
-    # Stage 1: train the new classification layers.
-    head_params = [
-        p for name, p in model.named_parameters()
-        if not name.startswith("features.")
-        and p.requires_grad
-    ]
-
-    optimizer = torch.optim.AdamW(
-        head_params,
-        lr=args.head_lr,
-        weight_decay=1e-4,
-    )
-
-    fit_phase(
-        args.warmup_epochs,
-        optimizer,
-        "head-only",
-    )
-
-    # Stage 2: fine-tune the final backbone block.
-    model.load_state_dict(best_state)
-    model.unfreeze_last_block()
-
-    head_params = [
-        p for name, p in model.named_parameters()
-        if not name.startswith("features.")
-        and p.requires_grad
-    ]
-
-    backbone_params = [
-        p for name, p in model.named_parameters()
-        if name.startswith("features.")
-        and p.requires_grad
-    ]
 
     optimizer = torch.optim.AdamW(
         [
             {
-                "params": head_params,
-                "lr": args.head_lr / 10,
+                "params": list(model.features.parameters()),
+                "lr": BACKBONE_LR,
             },
             {
-                "params": backbone_params,
-                "lr": args.backbone_lr,
+                "params": list(model.classifier.parameters()),
+                "lr": HEAD_LR,
             },
         ],
-        weight_decay=1e-4,
+        weight_decay=WEIGHT_DECAY,
     )
 
-    fit_phase(
-        args.finetune_epochs,
-        optimizer,
-        "fine-tune",
+    total_epochs = TOTAL_EPOCHS
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_epochs
     )
 
-    # Evaluate the best validation checkpoint on the test set.
-    model.load_state_dict(best_state)
+    history = []
 
-    _, y_true, y_pred, probs = evaluate(
+    print("\nStarting training...")
+    print(f"Head-only epochs: {HEAD_ONLY_EPOCHS}")
+    print(f"Fine-tuning epochs: {FINETUNE_EPOCHS}")
+
+    for epoch in range(total_epochs):
+        if epoch == HEAD_ONLY_EPOCHS:
+            print("\nUnfreezing backbone for fine-tuning.")
+            model.unfreeze_backbone()
+
+        train_loss, train_accuracy = train_one_epoch(
+            model, train_loader, optimizer, criterion, device
+        )
+
+        scheduler.step()
+
+        record = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_accuracy": train_accuracy,
+        }
+        history.append(record)
+
+        print(
+            f"Epoch {epoch + 1:02d}/{total_epochs} | "
+            f"train_loss={train_loss:.4f} | "
+            f"train_accuracy={train_accuracy:.4f}"
+        )
+
+    # Save the final epoch, without selecting a model based on test data.
+    with (OUTPUT_DIR / "training_history.json").open("w") as f:
+        json.dump(history, f, indent=2)
+
+    print("\nEvaluating once on the held-out test set...")
+    metrics, y_true, y_pred, y_prob = evaluate(
         model, test_loader, device
     )
 
-    report = classification_report(
-        y_true,
-        y_pred,
-        labels=list(range(4)),
-        target_names=CLASSES,
-        output_dict=True,
-        zero_division=0,
-    )
+    print(f"Test loss:       {metrics['loss']:.4f}")
+    print(f"Test accuracy:   {metrics['accuracy']:.4f}")
+    print(f"Test macro-F1:   {metrics['macro_f1']:.4f}")
+    print(f"Test weighted-F1:{metrics['weighted_f1']:.4f}")
 
-    (out_dir / f"{arch}_test_report.json").write_text(
-        json.dumps(report, indent=2)
-    )
-
-    pd.DataFrame(
-        confusion_matrix(
-            y_true, y_pred, labels=list(range(4))
-        ),
-        index=CLASSES,
-        columns=CLASSES,
-    ).to_csv(out_dir / f"{arch}_confusion_matrix.csv")
-
-    predictions = test_df[
-        ["crop_path", "source_image_id", "label"]
-    ].copy()
-
-    predictions["predicted_label"] = [
-        CLASSES[i] for i in y_pred
-    ]
-
-    for i, cls in enumerate(CLASSES):
-        predictions[f"prob_{cls}"] = probs[:, i]
-
-    predictions.to_csv(
-        out_dir / f"{arch}_test_predictions.csv",
-        index=False,
-    )
-
-    return {
-        "model": arch,
-        "test_accuracy": accuracy_score(y_true, y_pred),
-        "test_balanced_accuracy": balanced_accuracy_score(
-            y_true, y_pred
-        ),
-        "test_macro_f1": f1_score(
-            y_true,
-            y_pred,
-            labels=list(range(4)),
-            average="macro",
-            zero_division=0,
-        ),
-        **{
-            f"recall_{cls}": report[cls]["recall"]
-            for cls in CLASSES
-        },
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--csv", type=Path, required=True)
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("runs/bug_classifier_comparison"),
-    )
-    parser.add_argument("--warmup-epochs", type=int, default=3)
-    parser.add_argument("--finetune-epochs", type=int, default=15)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--head-lr", type=float, default=1e-3)
-    parser.add_argument("--backbone-lr", type=float, default=1e-5)
-
-    args = parser.parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    df = load_manifest(args.csv)
-    train_df, val_df, test_df = split_grouped(df)
-
-    meta_cols = [
-        "meta_w", "meta_h", "meta_ar", "meta_conf"
-    ]
-
-    # Fit metadata scaling on training data only.
-    meta_mean = train_df[meta_cols].mean().to_numpy(
-        dtype=np.float32
-    )
-    meta_std = train_df[meta_cols].std().to_numpy(
-        dtype=np.float32
-    )
-    meta_std[meta_std < 1e-6] = 1.0
-
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    print(f"Device: {device}")
+    print("\nPer-class results:")
     print(
-        f"Crops: train={len(train_df)}, "
-        f"validation={len(val_df)}, test={len(test_df)}"
-    )
-    print(
-        "Training class counts:",
-        train_df.label.value_counts()
-        .reindex(CLASSES, fill_value=0).to_dict(),
+        json.dumps(metrics["classification_report"], indent=2)
     )
 
-    results = []
+    with (OUTPUT_DIR / "test_metrics.json").open("w") as f:
+        json.dump(metrics, f, indent=2)
 
-    for arch in ["vgg16", "mobilenet_v3_small"]:
-        results.append(
-            train_one(
-                arch,
-                train_df,
-                val_df,
-                test_df,
-                meta_mean,
-                meta_std,
-                args,
-                args.output_dir,
-                device,
-            )
-        )
-
-    comparison = pd.DataFrame(results).sort_values(
-        "test_macro_f1",
-        ascending=False,
+    save_confusion_matrix(
+        np.asarray(metrics["confusion_matrix"]),
+        OUTPUT_DIR / "confusion_matrix.png",
     )
 
-    comparison.to_csv(
-        args.output_dir / "model_comparison.csv",
-        index=False,
-    )
+    # Restore model to CPU for checkpointing and export.
+    export_models(model, device)
 
-    print("\nFinal model comparison:")
-    print(comparison.to_string(index=False))
+    print("\nAll outputs saved in:", OUTPUT_DIR.resolve())
 
 
 if __name__ == "__main__":
