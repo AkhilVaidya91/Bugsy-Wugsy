@@ -9,7 +9,12 @@ python -m pipeline.main \\
     --out-dir   captures \\
     --server    http://192.168.1.50:5000/upload \\
     --save-every 10 \\
-    --det-conf  0.4
+    --det-conf  0.4 \\
+    --lights-pins 26
+
+The ring lights (relay board on GPIO) are switched on before the camera
+starts, so autofocus runs under the same light as the frames you analyse,
+and are switched off again when the pipeline stops.
 
 Press Ctrl-C to stop.
 """
@@ -17,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import time
 from collections import deque
 from datetime import datetime
@@ -30,6 +36,7 @@ from .camera import Camera
 from .classifier import CLASSES, Classifier
 from .detector import Detector
 from .display import EInk
+from .lights import Lights, parse_pins
 from .storage import Storage, draw_annotations
 from .uploader import Uploader
 
@@ -59,43 +66,71 @@ def _smooth_counts(history: deque) -> Dict[str, int]:
     }
 
 
+def _on_sigterm(signum, frame):  # noqa: ARG001
+    """Treat SIGTERM (systemd stop, `kill`) like Ctrl-C so the lights are switched off."""
+    raise KeyboardInterrupt
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> None:
-    log.info("Loading detector from %s", args.detector)
-    detector = Detector(args.detector, confidence=args.det_conf)
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
-    log.info("Loading classifier from %s", args.classifier)
-    classifier = Classifier(args.classifier)
-
-    storage = Storage(args.out_dir)
-
-    eink = EInk(min_s=args.display_interval)
-
-    uploader: Uploader | None = None
-    if args.server:
-        log.info("Uploading to %s", args.server)
-        uploader = Uploader(args.server, timeout_s=args.upload_timeout)
-
-    log.info("Starting camera (AF will block until settled)")
-    cam = Camera(
-        width=args.width,
-        height=args.height,
-        af=not args.no_af,
+    # Lights first: creating the object also forces the relay OFF, so a relay
+    # left on by an earlier run is switched off while the models load.
+    lights = Lights(
+        pins=parse_pins(args.lights_pins),
+        active_low=not args.lights_active_high,
+        enabled=not args.no_lights,
     )
 
-    smooth_window = deque(maxlen=max(1, args.smooth))
-    frame_n = 0
-    fps_clock = time.time()
-    fps_estimate = 0.0
-
-    log.info("Pipeline running – press Ctrl-C to stop")
+    cam = None
     try:
+        log.info("Loading detector from %s", args.detector)
+        detector = Detector(args.detector, confidence=args.det_conf)
+
+        log.info("Loading classifier from %s", args.classifier)
+        classifier = Classifier(args.classifier)
+
+        storage = Storage(args.out_dir)
+
+        eink = EInk(min_s=args.display_interval)
+
+        uploader: Uploader | None = None
+        if args.server:
+            log.info("Uploading to %s", args.server)
+            uploader = Uploader(args.server, timeout_s=args.upload_timeout)
+
+        # Lights on BEFORE the camera starts, so the autofocus cycle in
+        # Camera() focuses under the real lighting.
+        if lights.enabled:
+            lights.on()
+            log.info(
+                "Lights on (%s) – waiting %.1fs to settle",
+                "relay ok" if lights.available else "NO GPIO: lights not switched",
+                args.lights_settle,
+            )
+            time.sleep(args.lights_settle)
+
+        log.info("Starting camera (AF will block until settled)")
+        cam = Camera(
+            width=args.width,
+            height=args.height,
+            af=not args.no_af,
+        )
+
+        smooth_window = deque(maxlen=max(1, args.smooth))
+        frame_n = 0          # frames processed since start (never reset)
+        fps_frames = 0       # frames in the current ~1 s FPS window
+        fps_clock = time.time()
+        fps_estimate = 0.0
+
+        log.info("Pipeline running – press Ctrl-C to stop")
         while True:
-            t0 = time.time()
             frame_n += 1
+            fps_frames += 1
 
             # 1. Grab frame.
             #    RGB888 capture arrays are stored BGR. Keep that representation
@@ -138,8 +173,8 @@ def run(args: argparse.Namespace) -> None:
             # 5. FPS estimate (rolling over ~1 s)
             elapsed = time.time() - fps_clock
             if elapsed >= 1.0:
-                fps_estimate = frame_n / elapsed
-                frame_n = 0
+                fps_estimate = fps_frames / elapsed
+                fps_frames = 0
                 fps_clock = time.time()
 
             # 6. Annotate and save every N frames
@@ -179,8 +214,10 @@ def run(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         log.info("Interrupted – shutting down")
     finally:
-        cam.close()
-        log.info("Done")
+        lights.off()          # always, even if model loading or the camera failed
+        if cam is not None:
+            cam.close()
+        log.info("Done (lights off)")
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +289,30 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-af",
         action="store_true",
-        help="Disable continuous autofocus (use fixed focus)",
+        help="Disable the start-up autofocus cycle (use fixed focus)",
+    )
+
+    # --- ring lights (relay board on GPIO) --------------------------------
+    p.add_argument(
+        "--no-lights",
+        action="store_true",
+        help="Do not switch the ring lights (e.g. when testing without the relay)",
+    )
+    p.add_argument(
+        "--lights-pins",
+        default="26",
+        help="BCM GPIO pin(s) of the relay that switches the ring lights, e.g. 26 or 26,21",
+    )
+    p.add_argument(
+        "--lights-active-high",
+        action="store_true",
+        help="Relay board switches ON when its pin is HIGH (default: ON when LOW)",
+    )
+    p.add_argument(
+        "--lights-settle",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after the lights come on, before the camera starts",
     )
     return p.parse_args()
 
