@@ -2,11 +2,14 @@
 
 Colour order
 ------------
-Picamera2 with format ``BGR888`` stores pixels as B, G, R in memory —
-the native byte order for OpenCV.  ``grab_frame()`` therefore returns a
-BGR uint8 array (H, W, 3) that can be passed directly to cv2 functions
-or annotated and saved with ``cv2.imwrite``.  Convert to RGB only when
-needed by a model that expects RGB (e.g. RF-DETR).
+Picamera2 with format ``RGB888`` returns pixels as R, G, B in memory.
+``grab_frame()`` therefore returns an **RGB** uint8 array (H, W, 3).
+
+  • Pass it directly to RF-DETR (which expects RGB).
+  • Convert to BGR with ``cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)``
+    before any OpenCV drawing or ``cv2.imwrite`` call.
+  • The classifier's ``classify()`` accepts BGR crops and converts
+    to RGB internally before normalisation.
 
 Autofocus strategy
 ------------------
@@ -27,7 +30,7 @@ log = logging.getLogger(__name__)
 
 
 class Camera:
-    """Wraps Picamera2 for continuous BGR frame streaming."""
+    """Wraps Picamera2 for continuous RGB frame streaming."""
 
     def __init__(self, width: int = 1920, height: int = 1080, af: bool = True):
         from libcamera import controls
@@ -35,9 +38,10 @@ class Camera:
 
         self.cam = Picamera2()
 
-        # BGR888 → capture_array gives native OpenCV byte order (B, G, R)
+        # RGB888 → capture_array returns R, G, B byte order (confirmed by
+        # Picamera2 docs). Convert to BGR in main.py before any OpenCV ops.
         cfg = self.cam.create_preview_configuration(
-            main={"size": (width, height), "format": "BGR888"}
+            main={"size": (width, height), "format": "RGB888"}
         )
         self.cam.configure(cfg)
         self.cam.start()
@@ -69,7 +73,7 @@ class Camera:
 
     # ------------------------------------------------------------------
     def grab_frame(self) -> np.ndarray:
-        """Return the latest frame as a **BGR** uint8 array (H, W, 3)."""
+        """Return the latest frame as an **RGB** uint8 array (H, W, 3)."""
         return self.cam.capture_array("main")
 
     def close(self) -> None:

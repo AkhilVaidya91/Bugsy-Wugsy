@@ -97,21 +97,21 @@ def run(args: argparse.Namespace) -> None:
             t0 = time.time()
             frame_n += 1
 
-            # 1. Grab frame – camera is configured as BGR888, so this is
-            #    already in OpenCV-native byte order (B, G, R).
-            bgr = cam.grab_frame()
+            # 1. Grab frame.
+            #    Camera format is RGB888 → capture_array returns RGB.
+            #    RF-DETR wants RGB, so pass directly to detect().
+            #    OpenCV (imwrite, rectangle, etc.) wants BGR, so convert once.
+            rgb = cam.grab_frame()
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            # RF-DETR expects RGB: cheap in-place channel flip (no copy)
-            rgb = bgr[:, :, ::-1]
-
-            # 2. Detect
+            # 2. Detect (model expects RGB)
             detections = detector.detect(rgb)
 
-            # 3. Classify each crop
+            # 3. Classify each crop.
+            #    Slice from bgr; classifier.classify() does BGR→RGB internally.
             classifications = []
             counts = _empty_counts()
             for det in detections:
-                # Crop the detection from the BGR frame
                 x1, y1 = max(0, int(det.x1)), max(0, int(det.y1))
                 x2 = min(bgr.shape[1], int(det.x2))
                 y2 = min(bgr.shape[0], int(det.y2))
@@ -120,7 +120,7 @@ def run(args: argparse.Namespace) -> None:
                     counts["other"] += 1
                     continue
 
-                crop = bgr[y1:y2, x1:x2]
+                crop = bgr[y1:y2, x1:x2]   # BGR crop
                 label, conf = classifier.classify(crop, det.w, det.h)
                 classifications.append((label, conf))
                 counts[label] = counts.get(label, 0) + 1
