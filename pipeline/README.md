@@ -42,13 +42,7 @@ pip install flask
 
 ```bash
 # from the repo root
-python -m pipeline.main \
-    --detector  models/weights.pt \
-    --classifier models/scale_effic.onnx \
-    --out-dir   captures \
-    --server    http://192.168.1.50:5000/upload \
-    --det-conf  0.4 \
-    --save-every 10
+python -m pipeline.main --detector models/weights.pt --classifier models/scale_effic.onnx --out-dir captures --server http://192.168.1.138:5000/upload --det-conf 0.4 --save-every 10
 ```
 
 ### Key flags
@@ -107,7 +101,7 @@ Both devices must be on the **same Wi-Fi or wired LAN**.
 
 4. **Pass the correct URL** to `--server`:
    ```
-   --server http://192.168.1.50:5000/upload
+   --server http://192.168.1.138:5000/upload
    ```
 
 If the upload fails the pipeline keeps running – the frame is just logged

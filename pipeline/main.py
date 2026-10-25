@@ -79,7 +79,7 @@ def run(args: argparse.Namespace) -> None:
         log.info("Uploading to %s", args.server)
         uploader = Uploader(args.server, timeout_s=args.upload_timeout)
 
-    log.info("Starting camera")
+    log.info("Starting camera (AF will block until settled)")
     cam = Camera(
         width=args.width,
         height=args.height,
@@ -97,11 +97,12 @@ def run(args: argparse.Namespace) -> None:
             t0 = time.time()
             frame_n += 1
 
-            # 1. Grab frame (RGB from Picamera2)
-            rgb = cam.grab_frame()
+            # 1. Grab frame – camera is configured as BGR888, so this is
+            #    already in OpenCV-native byte order (B, G, R).
+            bgr = cam.grab_frame()
 
-            # Convert to BGR for OpenCV operations
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            # RF-DETR expects RGB: cheap in-place channel flip (no copy)
+            rgb = bgr[:, :, ::-1]
 
             # 2. Detect
             detections = detector.detect(rgb)

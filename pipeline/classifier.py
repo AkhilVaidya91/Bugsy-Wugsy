@@ -2,10 +2,13 @@
 
 The model was exported from classification_training/train.py.
 It expects two ONNX inputs:
-  - image  : float32 [1, 3, 224, 224]  (ImageNet-normalised)
+  - image  : float32 [1, 3, 224, 224]  (ImageNet-normalised, RGB channel order)
   - scale  : float32 [1, 2]            (log1p(bbox_w), log1p(bbox_h))
 
 It returns logits float32 [1, 4] for classes ["1", "2", "3", "other"].
+
+``classify()`` accepts a **BGR** crop (OpenCV convention) and converts
+to RGB internally before normalisation.
 """
 from __future__ import annotations
 
