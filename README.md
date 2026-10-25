@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # bugbox
 
 A Mothbox-style insect imager that you install as a normal app on your current Raspberry Pi OS.
@@ -115,3 +116,7 @@ answers), and the Roboflow glue code against stand-ins that follow Roboflow's do
 **Not tested on real hardware:** the Picamera2 capture and autofocus code, the relay GPIO, the e-ink push, the
 `inference` and `inference-sdk` packages themselves, `udisksctl` mounting, and the installer. Expect to fix small things on first run;
 `bugbox status`, `bugbox lights blink` and `bugbox camera-test` are there to find them one at a time.
+=======
+# Bugsy-Wugsy
+Real time bug detection, identification and alert system
+>>>>>>> 4e87d7c834c245a5c497a2163d612ba8955536b0
