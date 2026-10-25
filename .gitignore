@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Datasets, generated crops, and training outputs
+classification_training/bugs_dataset/
+classification_training/data/
+classification_training/runs/
+scale_aware/**/train/
+scale_aware/**/valid/
+scale_aware/**/test/
+scale_aware/**/outputs/
+*.pt
+*.onnx
