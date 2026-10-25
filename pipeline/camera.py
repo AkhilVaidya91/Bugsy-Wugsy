@@ -2,12 +2,12 @@
 
 Colour order
 ------------
-Picamera2 with format ``RGB888`` returns pixels as R, G, B in memory.
-``grab_frame()`` therefore returns an **RGB** uint8 array (H, W, 3).
+Picamera2's ``RGB888`` capture array is stored in BGR byte order (the
+OpenCV-compatible layout). ``grab_frame()`` therefore returns a **BGR**
+uint8 array (H, W, 3).
 
-  • Pass it directly to RF-DETR (which expects RGB).
-  • Convert to BGR with ``cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)``
-    before any OpenCV drawing or ``cv2.imwrite`` call.
+  • Convert to RGB before passing a frame to RF-DETR.
+  • Use the frame directly for OpenCV drawing and ``cv2.imwrite``.
   • The classifier's ``classify()`` accepts BGR crops and converts
     to RGB internally before normalisation.
 
@@ -38,8 +38,8 @@ class Camera:
 
         self.cam = Picamera2()
 
-        # RGB888 → capture_array returns R, G, B byte order (confirmed by
-        # Picamera2 docs). Convert to BGR in main.py before any OpenCV ops.
+        # RGB888 capture_array uses BGR byte order, which is also the
+        # convention used by OpenCV and the classifier crop interface.
         cfg = self.cam.create_preview_configuration(
             main={"size": (width, height), "format": "RGB888"}
         )
@@ -73,7 +73,7 @@ class Camera:
 
     # ------------------------------------------------------------------
     def grab_frame(self) -> np.ndarray:
-        """Return the latest frame as an **RGB** uint8 array (H, W, 3)."""
+        """Return the latest frame as a **BGR** uint8 array (H, W, 3)."""
         return self.cam.capture_array("main")
 
     def close(self) -> None:

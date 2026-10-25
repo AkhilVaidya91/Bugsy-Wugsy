@@ -98,11 +98,10 @@ def run(args: argparse.Namespace) -> None:
             frame_n += 1
 
             # 1. Grab frame.
-            #    Camera format is RGB888 → capture_array returns RGB.
-            #    RF-DETR wants RGB, so pass directly to detect().
-            #    OpenCV (imwrite, rectangle, etc.) wants BGR, so convert once.
-            rgb = cam.grab_frame()
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            #    RGB888 capture arrays are stored BGR. Keep that representation
+            #    for OpenCV and crops, and convert only for RF-DETR.
+            bgr = cam.grab_frame()
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
             # 2. Detect (model expects RGB)
             detections = detector.detect(rgb)
