@@ -5,6 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
@@ -198,6 +199,50 @@ class LocalBackend(Backend):
         return parse_predictions(_g(res, "predictions", default=[]))
 
 
+class RFDETRBackend(Backend):
+    """Runs a Roboflow RF-DETR Small checkpoint directly with the rfdetr package."""
+    name = "rfdetr"
+
+    def __init__(self, weights: str, confidence: float):
+        path = Path(weights).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"RF-DETR weights file not found: {path}")
+        try:
+            from rfdetr import RFDETRSmall
+        except ImportError as e:
+            raise RuntimeError("standalone RF-DETR requires the 'rfdetr' package (pip install rfdetr)") from e
+        self.model_id = str(path)
+        self.conf = confidence
+        log.info("standalone RF-DETR: loading %s", path)
+        self.model = RFDETRSmall(pretrain_weights=str(path))
+
+    def infer_array(self, img):
+        # RF-DETR's public API expects RGB arrays, while bugbox camera frames are BGR.
+        rgb = np.ascontiguousarray(img[:, :, ::-1])
+        result = self.model.predict(rgb, threshold=self.conf, include_source_image=False)
+        if isinstance(result, (list, tuple)):
+            result = result[0] if result else None
+        if result is None:
+            return []
+        xyxy = np.asarray(getattr(result, "xyxy", []))
+        confidence = np.asarray(getattr(result, "confidence", []))
+        class_ids = np.asarray(getattr(result, "class_id", []))
+        data = getattr(result, "data", {}) or {}
+        names = data.get("class_name", []) if hasattr(data, "get") else []
+        model_names = getattr(self.model, "class_names", None) or []
+        out = []
+        for i, box in enumerate(xyxy):
+            x1, y1, x2, y2 = map(float, box)
+            class_id = int(class_ids[i]) if i < len(class_ids) else -1
+            label = names[i] if i < len(names) else (
+                model_names[class_id] if 0 <= class_id < len(model_names) else str(class_id)
+            )
+            score = float(confidence[i]) if i < len(confidence) else 0.0
+            out.append(Detection(str(label), score, (x1 + x2) / 2, (y1 + y2) / 2,
+                                 max(0.0, x2 - x1), max(0.0, y2 - y1)))
+        return out
+
+
 class HTTPBackend(Backend):
     """Roboflow Inference HTTP API: the Serverless Cloud API, or a server on this Pi."""
 
@@ -261,8 +306,10 @@ class Detector:
     def stats(self):
         return None
 
-    def __init__(self, backend: Backend, cfg):
+    def __init__(self, backend: Backend, cfg, classifier=None):
         self.backend = backend
+        self.classifier = classifier
+        self.cfg = cfg
         self.dcfg = cfg.detect
         self.labeler = Labeler(self.dcfg.targets, self.dcfg.other_label,
                                vars(self.dcfg.aliases) if hasattr(self.dcfg, "aliases") else {})
@@ -273,17 +320,46 @@ class Detector:
         if n <= 1:
             dets = self.backend.infer_array(img)
             dets = [d for d in dets if d.confidence >= float(self.dcfg.confidence)]
-            return nms(dets, float(self.dcfg.nms_iou))
-        allp: List[Detection] = []
-        for (x0, y0, x1, y1) in tile_boxes(w, h, n, float(self.dcfg.tile_overlap)):
-            for d in self.backend.infer_array(np.ascontiguousarray(img[y0:y1, x0:x1])):
-                if d.confidence >= float(self.dcfg.confidence):
-                    d.x += x0; d.y += y0
-                    allp.append(d)
-        return merge_tiles(allp, float(self.dcfg.nms_iou))
+            dets = nms(dets, float(self.dcfg.nms_iou))
+        else:
+            allp: List[Detection] = []
+            for (x0, y0, x1, y1) in tile_boxes(w, h, n, float(self.dcfg.tile_overlap)):
+                for d in self.backend.infer_array(np.ascontiguousarray(img[y0:y1, x0:x1])):
+                    if d.confidence >= float(self.dcfg.confidence):
+                        d.x += x0; d.y += y0
+                        allp.append(d)
+            dets = merge_tiles(allp, float(self.dcfg.nms_iou))
+        if self.classifier:
+            dets = self._classify(img, dets)
+        return dets
+
+    def _classify(self, img: np.ndarray, dets: List[Detection]) -> List[Detection]:
+        height, width = img.shape[:2]
+        classified = []
+        for det in dets:
+            pad_x, pad_y = det.w * 0.1, det.h * 0.1
+            x1 = max(0, int(det.x - det.w / 2 - pad_x))
+            y1 = max(0, int(det.y - det.h / 2 - pad_y))
+            x2 = min(width, int(det.x + det.w / 2 + pad_x))
+            y2 = min(height, int(det.y + det.h / 2 + pad_y))
+            if x2 <= x1 or y2 <= y1:
+                raise RuntimeError(f"classifier crop has invalid bounds for detection {det.to_dict()}")
+            label, confidence = self.classifier.classify(np.ascontiguousarray(img[y1:y2, x1:x2]), det)
+            classifier_cfg = getattr(self.cfg, "classifier", None)
+            min_confidence = float(getattr(classifier_cfg, "min_confidence", 0.0))
+            if confidence >= min_confidence:
+                det.local_label = det.label
+                det.label = label
+            classified.append(det)
+        return classified
 
     def count(self, dets):
         return self.labeler.count(dets, float(self.dcfg.confidence))
+
+
+def _project_path(value: str) -> Path:
+    path = Path(os.path.expanduser(value))
+    return path if path.is_absolute() else Path(__file__).resolve().parents[1] / path
 
 
 def build_backend(cfg, mode: str) -> Backend:
@@ -296,6 +372,8 @@ def build_backend(cfg, mode: str) -> Backend:
         if not key:
             raise RuntimeError(f"cloud mode needs your Roboflow API key in ${cfg.roboflow.api_key_env}")
         return HTTPBackend(cfg.cloud.api_url, key, model_id, conf, int(cfg.cloud.max_side), name="cloud")
+    if mode == "standalone" and not model_id and hasattr(cfg.standalone, "detector_weights"):
+        return RFDETRBackend(str(_project_path(cfg.standalone.detector_weights)), conf)
     if cfg.standalone.server_url:
         return HTTPBackend(cfg.standalone.server_url, key, model_id, conf, 4096, name="local-server")
     cache = cfg.standalone.cache_dir or str(cfg.data_dir() / "models")
@@ -345,6 +423,56 @@ class RoboflowClassifier:
 
     def classify(self, crop, det=None):
         return parse_classification(self.client.infer(crop, model_id=self.model_id))
+
+
+class ONNXClassifier:
+    """Runs the bundled crop classifier and supplies the box size as scale metadata."""
+
+    labels = ("1", "2", "3", "other")
+
+    def __init__(self, weights: str):
+        path = Path(weights).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"ONNX classifier file not found: {path}")
+        try:
+            import onnxruntime as ort
+        except ImportError as e:
+            raise RuntimeError("standalone classification requires 'onnxruntime'") from e
+        import cv2
+        from PIL import Image, ImageOps
+        self._cv2 = cv2
+        self._Image = Image
+        self._ImageOps = ImageOps
+        self.model_id = str(path)
+        self.session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+        self.image_input, self.scale_input = [x.name for x in self.session.get_inputs()]
+        self.output = self.session.get_outputs()[0].name
+
+    def classify(self, crop, det=None):
+        if det is None:
+            raise ValueError("ONNXClassifier.classify requires the source detection")
+        rgb = self._cv2.cvtColor(crop, self._cv2.COLOR_BGR2RGB)
+        image = self._Image.fromarray(rgb)
+        image = self._ImageOps.pad(image, (224, 224), color=(0, 0, 0))
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        array = (array - np.asarray((0.485, 0.456, 0.406), dtype=np.float32)) / np.asarray(
+            (0.229, 0.224, 0.225), dtype=np.float32
+        )
+        array = np.transpose(array, (2, 0, 1))[None, ...]
+        # The exported model has two scale inputs. They match train.py's log-transformed
+        # bounding-box width and height; confidence/aspect ratio are not part of this export.
+        scale = np.log1p(np.asarray([[max(det.w, 0.0), max(det.h, 0.0)]], dtype=np.float32))
+        logits = self.session.run([self.output], {self.image_input: array, self.scale_input: scale})[0]
+        probs = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+        probs /= probs.sum(axis=1, keepdims=True)
+        index = int(np.argmax(probs[0]))
+        return self.labels[index], float(probs[0, index])
+
+
+def build_standalone_classifier(cfg):
+    if not hasattr(cfg.standalone, "classifier_weights"):
+        raise RuntimeError("standalone.classifier_weights is not configured")
+    return ONNXClassifier(str(_project_path(cfg.standalone.classifier_weights)))
 
 
 class FakeClassifier:

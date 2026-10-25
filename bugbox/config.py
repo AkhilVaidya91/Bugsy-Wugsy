@@ -67,6 +67,8 @@ model_id = ""                      # "your-project/1"
 style = "stills"          # "stills" = timed photos saved to the USB drive, "stream" = live frames
 server_url = ""           # optional: a local Roboflow Inference server, e.g. http://localhost:9001
 cache_dir = ""            # model weight cache; blank = <data_dir>/models
+detector_weights = "models/weights.pt"
+classifier_weights = "models/scale_effic.onnx"
 
 [hybrid]
 style = "stills"          # "stills" = timed photos saved to USB, "stream" = live frames

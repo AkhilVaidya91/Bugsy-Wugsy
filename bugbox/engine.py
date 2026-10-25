@@ -18,7 +18,7 @@ from .annotate import annotate, save_jpeg
 from .camera import World, make_camera
 from .config import MODES
 from .detect import (Detector, FakeBackend, FakeClassifier, HybridDetector, build_backend,
-                     build_classifier)
+                     build_classifier, build_standalone_classifier)
 from .display import EInk
 from .lights import Lights
 from .records import Result, append_csv, embed_exif, write_json
@@ -89,6 +89,10 @@ class Engine:
                 used = saved.get("n", 0) if saved.get("date") == time.strftime("%Y-%m-%d") else 0
                 self._detector = HybridDetector(backend, classifier, self.cfg, warn, used, self._persist_budget)
                 self.state["backend"] = backend.name + ("+cloud-classify" if classifier else " (cloud classifier off)")
+            elif mode == "standalone" and not self.simulate:
+                classifier = build_standalone_classifier(self.cfg)
+                self._detector = Detector(backend, self.cfg, classifier=classifier)
+                self.state["backend"] = backend.name + "+onnx-classify"
             else:
                 self._detector = Detector(backend, self.cfg)
                 self.state["backend"] = backend.name
