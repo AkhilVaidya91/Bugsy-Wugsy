@@ -120,7 +120,13 @@ def run(args: argparse.Namespace) -> None:
                     continue
 
                 crop = bgr[y1:y2, x1:x2]   # BGR crop
-                label, conf = classifier.classify(crop, det.w, det.h)
+                label, conf = classifier.classify(
+                    crop,
+                    det.w,
+                    det.h,
+                    bgr.shape[1],
+                    bgr.shape[0],
+                )
                 classifications.append((label, conf))
                 counts[label] = counts.get(label, 0) + 1
 

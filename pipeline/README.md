@@ -20,6 +20,13 @@ server/
 └── receiver.py     # Flask server that runs on your PC
 ```
 
+The bundled `models/scale_effic.onnx` is the scale-aware model exported by
+`scale_aware/Bugs Detection.yolo26/train.py`. Its image input is RGB float32
+in `[0, 1]`; ImageNet normalization is inside the model. Its two scale inputs
+are `log1p(original_bbox_area_pixels) / 20` and
+`original_bbox_area_pixels / original_frame_area`. The runtime must use the
+original detector box dimensions, not the padded crop dimensions.
+
 ## Pi dependencies
 
 ```bash
