@@ -1,122 +1,356 @@
-<<<<<<< HEAD
-# bugbox
+# Bugsy-Wugsy
 
-A Mothbox-style insect imager that you install as a normal app on your current Raspberry Pi OS.
-No firmware, no re-flashing the SD card, any user name.
+Bugsy-Wugsy is a real-time insect detection, identification, counting, and
+alert system for Raspberry Pi. It is designed for Mothbox-style deployments
+using a relay-controlled light ring, a Raspberry Pi camera, optional USB
+storage, and an optional Waveshare e-ink display.
 
-It drives the same hardware as the Mothbox (relay board + ring lights on GPIO, Arducam 64MP, USB drive,
-Waveshare e-ink) and counts insects by species.
+The main application is called **bugbox**. It runs as a normal application on
+an existing Raspberry Pi OS installation; it does not require custom firmware
+or re-flashing the SD card.
 
-## The modes
+## Features
 
-| Mode | Detection and counting | Cloud use | Photos |
-|---|---|---|---|
-| **standalone** | On the Pi (Roboflow Inference, free, works offline after `bugbox warmup`) | none | USB drive only |
-| **hybrid** | On the Pi | The cloud is asked to **name single insects** the Pi is unsure about | USB drive only |
-| cloud (optional) | Every frame analysed by Roboflow | most credits, not recommended on a budget | USB if present |
+- Detects insects in still images or a live camera stream.
+- Counts insects by species, including configured target species and an
+  `other insect` category.
+- Supports local, hybrid, and cloud processing modes.
+- Saves annotated images, per-image JSON records, and CSV count summaries.
+- Provides a local web dashboard with live counts and capture controls.
+- Controls relay-connected ring lights and optional e-ink status hardware.
+- Includes scheduling, diagnostics, USB storage protection, and optional
+  automatic startup.
+- Supports simulated operation without camera, GPIO, display, or Roboflow
+  hardware.
 
-Switch any time: dashboard buttons, `bugbox mode hybrid`, or a jumper on `power.switch_pin`.
+## Processing modes
 
-### How hybrid mode keeps cloud use tiny
+| Mode | Detection and classification | Network use | Recommended for |
+| --- | --- | --- | --- |
+| `standalone` | Runs on the Raspberry Pi with Roboflow Inference | None after model warmup | Offline deployments and lowest recurring cost |
+| `hybrid` | Detects locally; sends selected insect crops to the cloud for classification | Only uncertain crops by default | Better labels while keeping cloud usage low |
+| `cloud` | Sends frames to Roboflow for analysis | Highest usage | Experiments and deployments with reliable internet |
 
-1. The Pi detects and counts every insect locally, so the **total count never depends on the network**.
-2. Only insects the Pi is unsure about (`hybrid.uncertain_below`, default 0.85) are cut out and sent to the cloud.
-   Set `classify = "all"` to check every insect, or `"off"` to never use the cloud.
-3. **A cache** remembers each answer. If the insect has not moved or changed (box overlap and colour thumbnail),
-   it is never sent again, so a live stream of a static sheet costs nothing after the first pass.
-4. **Hard limits:** `max_calls_per_minute` and `daily_budget` (remembered across restarts). When they are used up,
-   or the network fails (three failures pause the cloud for a minute), the Pi's own labels are used and counting continues.
-5. Each crop is padded and enlarged (`crop_pad`, `crop_target_side`), which also helps with small insects on a large sheet.
-   The dashboard and annotated photos mark cloud-named insects with `*`.
+Change modes from the dashboard, with `bugbox mode <mode>`, or with the
+configured hardware mode switch. The default mode is `standalone`.
 
-**Which cloud model?** `[classifier] model_id` takes a Roboflow classification model (`project/version`).
-Leave it blank to reuse your detection model on the cropped insect, which needs no extra training. Single-label classifiers,
-multi-label classifiers and detection models are all understood. Tell me if you meant a different cloud service.
+### How hybrid mode limits cloud usage
 
-**Cost.** Per Roboflow's September 18, 2026 announcement, running models locally with Roboflow Inference no longer uses
-credits, and the Serverless API is billed per image by model. Their pricing page works out to roughly
-`max(processing ms, 100 ms) / 500,000` credits per image, about 0.2 credits per 1,000 images for a small model.
-Check your own numbers under Plan and Billing in Roboflow; plans and prices there change.
+1. The Pi detects and counts every insect locally, so the total count does not
+   depend on network availability.
+2. By default, only detections below `hybrid.uncertain_below` are sent for
+   cloud classification. Set `hybrid.classify = "all"` to check every insect,
+   or `"off"` to disable cloud classification.
+3. A cache avoids sending an unchanged insect crop repeatedly.
+4. `max_calls_per_minute` and `daily_budget` provide hard usage limits. If a
+   limit is reached, the local label is retained and counting continues.
+5. Network failures temporarily pause cloud classification; local detection
+   continues.
 
-## Install
+Cloud-classified insects are marked with `*` in the dashboard and annotated
+images. Set `[classifier] model_id` to a Roboflow classification model
+(`project/version`). If it is blank, the configured detection model is reused
+on the cropped insect.
+
+## Hardware and software requirements
+
+### Recommended hardware
+
+- Raspberry Pi 5 running Raspberry Pi OS Bookworm.
+- Arducam or compatible Picamera2 camera.
+- Relay board and ring lights connected to GPIO.
+- USB drive for photo storage in `standalone` and `hybrid` modes.
+- Optional Waveshare 2.13-inch e-ink display.
+- Internet access for installation, model warmup, and cloud mode.
+
+The application can also run in simulation mode on a regular computer.
+
+### Software prerequisites
+
+- Raspberry Pi OS with `sudo` access.
+- Python 3.11 or the version supported by the installed Roboflow Inference
+  package.
+- Internet access during installation.
+
+## Installation
+
+From the project directory on the Raspberry Pi:
 
 ```bash
-unzip bugbox.zip && cd bugbox
-bash install.sh              # add --cloud-only to skip the big local-model package (not for standalone or hybrid)
-bugbox set-key               # paste your Roboflow API key (hidden prompt, stored in ~/.config/bugbox/env)
-nano ~/.config/bugbox/config.toml    # set  roboflow.model_id = "your-project/1"   and   mode = "hybrid"
-bugbox status
-bugbox lights blink          # relay board + ring lights
-bugbox camera-test           # one lit test photo, ~/camera_test.jpg
-bugbox warmup                # download the Pi's model once, while online
-bugbox run                   # dashboard at http://localhost:8080
-bugbox install-service       # optional: start at boot
+unzip bugbox.zip
+cd bugbox
+bash install.sh
 ```
 
-Try everything without hardware or a Roboflow account: `bugbox --simulate run`.
+The installer:
 
-## What it does (Mothbox functions, and where they live)
+1. Installs Raspberry Pi camera, GPIO, SPI, image, and USB-mounting packages.
+2. Creates a virtual environment at `.venv`.
+3. Installs the Roboflow cloud package and, unless disabled, the local
+   inference package.
+4. Installs the Waveshare e-ink library.
+5. Creates a default configuration and the `bugbox` launcher.
 
-| Mothbox function | bugbox |
-|---|---|
-| Lights switched by relay, active low, GPIO pin(s) | `[lights]` pins, active_low, policy (`capture`, `session`, `off`), settle time |
-| Timed full-resolution photos, fixed exposure option | `[camera]`, `[stills] interval_s` |
-| Autofocus calibration every 10 min, lens locked between | `focus = "calibrate"`, `calibrate_every_s` |
-| Vertical flip | `vflip`, `hflip` |
-| Photo folders named after the box, timestamps, EXIF notes | `<usb>/bugbox/<name>/<date>/<name>_<time>.jpg`, counts written into EXIF |
-| Back up to USB, copy over later | Writes to USB directly. With `fallback_to_sd = true` it buffers on the SD card and moves files over when a drive appears |
-| Free-space guard | `min_free_gb` |
-| Session schedule (weekdays, hours, minutes, runtime) | `[schedule]` |
-| Sleep between sessions with RTC wake-up | `[power] sleep_between_sessions` + `bugbox power-setup` (same bootloader keys the Mothbox sets) |
-| Mode jumper | `[power] switch_pin` (grounded = hybrid) |
-| E-ink status screen | `[display]`, now shows species counts, USB, last update |
-| Diagnostics log (temperature, throttling, disk, Wi-Fi, voltage) | `logs/diagnostics.jsonl` every `[diagnostics] interval_s` |
-| Time zone and clock | `bugbox time --timezone America/New_York`, `--set`, `--ntp` |
-| Wi-Fi provisioning | `bugbox wifi BugBytes hackathon` |
-| Settings editor | `config.toml` (commented), plus mode, capture and lights controls in the dashboard |
+Installation options:
 
-**Not copied:** GPS, battery percentage, Party mode, HDR bracketing, PNG/BMP output, LED blink codes, Pro-board detection.
+```bash
+bash install.sh --cloud-only  # Skip the large local inference package
+bash install.sh --no-eink     # Skip the Waveshare e-ink library
+```
 
-## New in bugbox
+`--cloud-only` is not suitable for `standalone` mode and is generally not
+appropriate for `hybrid` mode.
 
-- Per-species counts for `[detect] targets` (default stink bug, chinch bug, wireworm) plus "other insect" and a total.
-  Class names are matched loosely (`Stink_Bug`, `stinkbug` and `stink bug` are the same); add `[detect.aliases]` for odd names.
-- Class-agnostic de-duplication (`nms_iou`), and optional tiling (`tiles = 2`) with merging for small insects on a large photo.
-- **Dashboard** (`http://localhost:8080`): live counts, annotated image, mode switch, "Capture and count now", lights test,
-  cloud calls used today. Set `[web] host = "0.0.0.0"` to open it from another computer (the hackathon Wi-Fi may block
-  device-to-device traffic; Pi Connect screen sharing on the Pi always works).
-- `bugbox evaluate photos/ truth.csv` scores the model against hand counts
-  (columns: `image, stink bug, chinch bug, wireworm, total`): exact-match, count accuracy and error per species.
-- Annotated copy of every photo, one JSON per photo, and a `counts.csv` per box (with a `cloud_calls` column).
+If the `bugbox` command is not found after installation, open a new shell or
+add the launcher directory to `PATH`:
 
-## Storage rules
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-`standalone` and `hybrid` refuse to write photos to the SD card (`usb_required_modes`). If no drive is found you get a clear
-error on the dashboard and e-ink, and nothing is lost silently. The drive is mounted automatically with `udisksctl` if the
-desktop has not done it. Full-cloud stream mode saves nothing unless `stream.save_every_n` is set.
+## Quick start
 
-## Things to know
+Configure the Roboflow key and model:
 
-- **Speed:** the Pi 5 runs the model on its CPU. Pick a small model and watch `latency_s` on the dashboard.
-  The first `bugbox warmup` needs internet. Weights are cached under `~/bugbox_data/models`
-  (Roboflow's default `/tmp/cache` is wiped on reboot).
-- **Python:** Roboflow's `inference` package supports Python up to 3.11, which Raspberry Pi OS Bookworm ships.
-- **Wi-Fi:** unlike the Mothbox firmware, bugbox does not switch Wi-Fi off, so hybrid mode and the dashboard work all the time.
-- **Crops from a detection model:** the "reuse the detection model on the crop" default is a pragmatic shortcut. A model trained on whole
-  sheets can behave differently on a single close-up insect; if cloud answers look wrong, train a small classifier on cropped insects
-  and put it in `classifier.model_id`. Compare using `bugbox evaluate` with `classify = "off"` and with `"all"`.
+```bash
+bugbox set-key
+nano ~/.config/bugbox/config.toml
+```
 
-## What has and has not been tested
+Set at least:
 
-Tested (simulation, 36 automated tests): configuration, schedule windows, detection merging and counting, storage rules
-(USB only, SD fallback, USB parsing), both capture pipelines, mode switching, the dashboard API, the evaluation scorer, the
-hybrid classifier (only unsure insects sent, cache, daily budget, failure fallback and circuit breaker, ignoring low-confidence
-answers), and the Roboflow glue code against stand-ins that follow Roboflow's documented API.
+```toml
+[roboflow]
+model_id = "your-project/1"
 
-**Not tested on real hardware:** the Picamera2 capture and autofocus code, the relay GPIO, the e-ink push, the
-`inference` and `inference-sdk` packages themselves, `udisksctl` mounting, and the installer. Expect to fix small things on first run;
-`bugbox status`, `bugbox lights blink` and `bugbox camera-test` are there to find them one at a time.
-=======
-# Bugsy-Wugsy
-Real time bug detection, identification and alert system
->>>>>>> 4e87d7c834c245a5c497a2163d612ba8955536b0
+mode = "hybrid"
+```
+
+Then check the installation and hardware one component at a time:
+
+```bash
+bugbox status
+bugbox lights blink
+bugbox camera-test
+bugbox warmup
+bugbox run
+```
+
+The dashboard is available at <http://localhost:8080>. To open it from
+another computer on the same network, set:
+
+```toml
+[web]
+host = "0.0.0.0"
+```
+
+Device-to-device traffic may be blocked by some Wi-Fi networks. Pi Connect
+screen sharing is an alternative when the dashboard cannot be reached
+remotely.
+
+To run at boot:
+
+```bash
+bugbox install-service
+```
+
+To try the application without hardware or a Roboflow account:
+
+```bash
+bugbox --simulate run
+```
+
+## Common commands
+
+| Command | Purpose |
+| --- | --- |
+| `bugbox status` | Show configuration, hardware, storage, and model status |
+| `bugbox run` | Start the dashboard and capture service |
+| `bugbox mode standalone` | Select local processing |
+| `bugbox mode hybrid` | Select local detection with optional cloud classification |
+| `bugbox mode cloud` | Select full cloud processing |
+| `bugbox lights blink` | Test the relay and ring lights |
+| `bugbox camera-test` | Capture one lit test image at `~/camera_test.jpg` |
+| `bugbox warmup` | Download and cache the local model |
+| `bugbox evaluate photos/ truth.csv` | Score predictions against hand-counted images |
+| `bugbox time --timezone America/New_York` | Configure the time zone |
+| `bugbox wifi <ssid> <password>` | Configure Wi-Fi provisioning |
+| `bugbox power-setup` | Configure RTC wake-up for scheduled sleeping |
+
+Run `bugbox --help` for the complete command and option list.
+
+## Configuration
+
+The default configuration is created at:
+
+```text
+~/.config/bugbox/config.toml
+```
+
+The `BUGBOX_CONFIG` environment variable can point to another file. Important
+settings include:
+
+| Section | Settings |
+| --- | --- |
+| `[camera]` | Camera backend, resolution, orientation, focus, exposure, and JPEG quality |
+| `[lights]` | GPIO pins, active-low behavior, light policy, and settle time |
+| `[storage]` | USB requirement, SD fallback, automatic mounting, free-space guard, and annotated images |
+| `[detect]` | Confidence threshold, duplicate-box merging, tiling, targets, and aliases |
+| `[roboflow]` | API-key environment variable and detection model |
+| `[standalone]` | Local detector/classifier weights and still/stream behavior |
+| `[hybrid]` | Cloud classification policy, confidence threshold, budgets, and crop settings |
+| `[classifier]` | Cloud classifier endpoint, model, cache, timeout, and minimum confidence |
+| `[cloud]` | Full-cloud stream settings and maximum upload size |
+| `[stills]` / `[stream]` | Capture interval, frame rate, smoothing, and save frequency |
+| `[schedule]` | Weekdays, hours, minutes, and session duration |
+| `[power]` | RTC sleep behavior and optional physical mode switch |
+| `[display]` / `[diagnostics]` | E-ink refresh and diagnostics intervals |
+| `[web]` | Dashboard host, port, and enabled state |
+
+The checked-in defaults in `bugbox/config.py` are also a complete reference
+for supported settings and their comments.
+
+### Species and aliases
+
+Target species are configured with `[detect] targets`:
+
+```toml
+[detect]
+targets = ["stink bug", "chinch bug", "wireworm"]
+other_label = "other insect"
+
+[detect.aliases]
+stinkbug = "stink bug"
+```
+
+Class names are normalized, so names such as `Stink_Bug`, `stinkbug`, and
+`stink bug` can be treated as the same target.
+
+## Storage and output
+
+By default, `standalone` and `hybrid` modes refuse to save photos to the SD
+card. This protects the Pi from filling its boot disk. Connect a USB drive
+before starting capture.
+
+Storage behavior can be changed with:
+
+```toml
+[storage]
+usb_required_modes = ["standalone", "hybrid"]
+fallback_to_sd = false
+auto_mount = true
+min_free_gb = 1.0
+keep_annotated = true
+```
+
+Photos are stored under a structure similar to:
+
+```text
+<usb>/bugbox/<box-name>/<date>/<box-name>_<time>.jpg
+```
+
+Depending on the selected mode and configuration, the application also
+produces:
+
+- Annotated copies with detection boxes and labels.
+- One JSON record per captured image.
+- `counts.csv` with per-species counts and cloud-call information.
+- `logs/diagnostics.jsonl` with temperature, throttling, disk, Wi-Fi, and
+  voltage information.
+- Cached local model files under `~/bugbox_data/models`.
+
+Full-cloud stream mode does not save images unless
+`stream.save_every_n` is greater than zero.
+
+## Evaluation
+
+Use the evaluation command to compare predictions with hand-counted images:
+
+```bash
+bugbox evaluate photos/ truth.csv
+```
+
+The truth CSV uses these columns:
+
+```text
+image, stink bug, chinch bug, wireworm, total
+```
+
+The report includes exact matches, count accuracy, and per-species error.
+For comparing local and cloud classification, run the evaluation once with
+`classify = "off"` and again with `classify = "all"`.
+
+## Standalone pipeline
+
+The repository also contains a separate continuous pipeline in
+[pipeline/](C:/Users/Lenovo/Documents/projects/hackathon/PSI/Bugsy-Wugsy/Bugsy-Wugsy/pipeline/).
+It is a lower-level workflow that captures frames with Picamera2, runs an
+RF-DETR detector and ONNX classifier, saves annotated frames, and can upload
+results to a PC receiver.
+
+See [pipeline/README.md](C:/Users/Lenovo/Documents/projects/hackathon/PSI/Bugsy-Wugsy/Bugsy-Wugsy/pipeline/README.md)
+for its dependencies, command-line flags, receiver setup, connectivity
+checks, and CSV schema. It is separate from the `bugbox` installer and
+configuration described above.
+
+## Troubleshooting
+
+Run these checks in order:
+
+```bash
+bugbox status
+bugbox lights blink
+bugbox camera-test
+bugbox warmup
+```
+
+Common causes of startup problems:
+
+- The camera is not detected by Picamera2 or the selected backend.
+- The relay GPIO pin or active-low setting is incorrect.
+- The USB drive is not mounted or has less than `storage.min_free_gb`
+  available.
+- The Roboflow API key or `roboflow.model_id` is missing.
+- The local model has not been downloaded with `bugbox warmup`.
+- The selected Python version is unsupported by the installed Roboflow
+  package.
+- SPI has not been enabled for the e-ink display.
+
+The installer attempts to enable SPI automatically. If that fails, enable it
+manually with `sudo raspi-config`, then reboot if requested.
+
+## Development and testing
+
+The test suite can run without Raspberry Pi hardware by using simulation and
+stand-in model interfaces:
+
+```bash
+python -m pytest tests
+```
+
+The test suite covers configuration, scheduling, detection merging and
+counting, storage rules, capture pipelines, mode switching, dashboard APIs,
+evaluation, hybrid classification, caching, budgets, failure fallback, and
+Roboflow integration glue.
+
+Real hardware paths are not covered by the automated tests, including
+Picamera2 autofocus, relay GPIO, e-ink output, `udisksctl` mounting, the
+installer, and the third-party `inference` packages. Test these separately
+with `status`, `lights blink`, and `camera-test` before deploying.
+
+## Project layout
+
+readme.md             Main documentation
+bugbox/                 Main application and command-line interface
+pipeline/               Separate continuous Pi-to-PC pipeline
+server/                 Flask receiver for the separate pipeline
+tests/                  Automated tests
+models/                 Local detector and classifier weights
+classification_training/Training utilities for crop classification
+annotated_detection/    Detection training utilities
+scale_aware/            Scale-aware model training utilities
+```
+
+## License
+
+See [LICENSE](C:/Users/Lenovo/Documents/projects/hackathon/PSI/Bugsy-Wugsy/Bugsy-Wugsy/LICENSE).
