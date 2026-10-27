@@ -1,5 +1,9 @@
 # Bugsy-Wugsy
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform: Raspberry Pi](https://img.shields.io/badge/platform-Raspberry%20Pi-C51A4A?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 Bugsy-Wugsy is a real-time insect detection, identification, counting, and
 alert system for Raspberry Pi. It is designed for Mothbox-style deployments
 using a relay-controlled light ring, a Raspberry Pi camera, optional USB
