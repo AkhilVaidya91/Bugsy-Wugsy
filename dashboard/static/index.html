@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- NC insect map. Built with help from Claude Code (Anthropic), cited per hackathon rules. -->
+<title>NC Insect Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<style>
+:root{--bg:#f4f5f2;--fg:#1d2321;--card:#fff;--mut:#5d6762;--line:#d9ded9;--acc:#2f7d4f;--bad:#b3261e}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+#app{display:flex;height:100%}#main{flex:1;min-width:0;display:flex;flex-direction:column}#map{flex:1;min-height:240px}
+#ana{border-top:1px solid var(--line);background:var(--card);padding:10px 14px;max-height:48%;overflow:auto}
+#ana.min #aBody{display:none}.abar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.abar b{margin-right:auto}
+select{font:inherit;padding:4px 6px;border-radius:6px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin:10px 0 6px}
+.tile{border:1px solid var(--line);border-radius:8px;padding:6px 10px}.tile b{display:block;font-size:20px;font-variant-numeric:tabular-nums}.tile span{color:var(--mut);font-size:12px}
+.alegend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--mut)}.alegend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:5px}
+#aChart{position:relative}#aChart svg{display:block;width:100%;height:190px}
+.tip{position:absolute;pointer-events:none;background:#fff;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;box-shadow:0 2px 6px #0002;white-space:nowrap}
+#aTbl table{font-size:12px}#aTbl td,#aTbl th{padding:3px 6px;border-bottom:1px solid var(--line);text-align:right}#aTbl th:first-child,#aTbl td:first-child{text-align:left}
+#side{width:300px;overflow:auto;padding:14px;border-left:1px solid var(--line);background:var(--card)}
+@media(max-width:760px){#app{flex-direction:column;height:auto}#main{height:auto}#map{height:60vh}#ana{max-height:none}#side{width:100%;border-left:0;border-top:1px solid var(--line)}}
+h1{font-size:17px;margin:0 0 4px}h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin:16px 0 6px}
+.sp{display:flex;flex-wrap:wrap;gap:6px}.sp button,.btn{font:inherit;padding:5px 10px;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+.sp button.on{background:var(--acc);border-color:var(--acc);color:#fff}
+table{width:100%;border-collapse:collapse}td{padding:4px 2px;border-bottom:1px solid var(--line)}td:last-child{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+tr.tot td{font-size:16px;border-bottom:0}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.ok{background:#e1f3e8;color:#1e6a3f}.off{background:#fde3e1;color:var(--bad)}.mut{color:var(--mut);font-size:12px}
+label{display:block;margin:4px 0;cursor:pointer}
+.legend{background:#fffe;padding:8px 10px;border-radius:8px;box-shadow:0 1px 4px #0003;font-size:12px;line-height:1.25}
+.legend .r{display:flex;align-items:center;gap:6px}.legend i{width:18px;height:14px;display:inline-block;opacity:.85}
+.legend .sim{margin-top:6px;border-top:1px solid #ddd;padding-top:5px}
+</style></head><body>
+<div id="app"><div id="main"><div id="map"></div>
+<section id="ana">
+ <div class="abar"><b>Analytics over time</b>
+  <select id="aTrap" aria-label="Trap"></select>
+  <select id="aHours" aria-label="Time range"><option value="1">Last hour</option><option value="6">6 hours</option><option value="24" selected>24 hours</option><option value="0">All</option></select>
+  <button class="btn" id="aTable">Table view</button><button class="btn" id="aHide">Hide</button></div>
+ <div id="aBody"><div class="tiles" id="aTiles"></div><div id="aLegend" class="alegend"></div><div id="aChart"></div><div id="aTbl" hidden></div></div>
+</section></div>
+<aside id="side">
+ <h1>NC Insect Map</h1>
+ <div id="status"></div>
+ <div class="mut" id="upd"></div>
+ <div style="margin-top:8px;display:flex;gap:8px;align-items:center"><button class="btn" id="now">Refresh now</button><span class="mut" id="cd"></span></div>
+ <h2>Species</h2><div class="sp" id="sp"></div>
+ <h2>Layers</h2>
+ <label><input type="checkbox" id="chDots" checked> Insect dots</label>
+ <label><input type="checkbox" id="chHeat"> Heat layer (radar look)</label>
+ <h2>LIVE - MothBox, Wake County</h2>
+ <table id="live"></table><div class="mut" id="liveUpd"></div>
+ <h2>Species key</h2><div id="key"></div>
+ <p class="mut">Grey counties have no trap. Only the Wake County MothBox is real; every other trap is <b>Simulated</b>.<br>Built with help from Claude Code.</p>
+</aside></div>
+<script>
+const REFRESH_SECONDS = 150;
+const SP = {total:"Total", stink_bug:"Stink bug", chinch_bug:"Chinch bug", wireworm:"Wireworm", other_insect:"Other insect"};
+// validated categorical set (colour-blind safe); species keep the same colour on the map and in the charts
+const SP_COLOR = {stink_bug:"#2a78d6", chinch_bug:"#eb6834", wireworm:"#1baf7a", other_insect:"#eda100"};
+// rainfall-style stepped ramp: blue -> green -> yellow -> orange -> red
+const STEPS = [0,1,2,3,5,7,10,15,20,25,30];
+const RAMP  = ["#c6e2f7","#7fb8e8","#3a86d1","#2bb3a0","#4cbb3f","#a6d633","#f2e630","#f7b52b","#f27c22","#e0401c","#a8101a"];
+const $ = id => document.getElementById(id);
+let species = "total", data = null, countyLayer, markers = L.layerGroup(), dots = L.layerGroup(), heat = null, nextAt = 0;
+
+const map = L.map("map", {zoomSnap:.25}).setView([35.35,-79.4], 7.25);
+// Esri light grey basemap: no API key needed (CARTO tiles now require one)
+L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+ {attribution:"Tiles &copy; Esri &mdash; Esri, HERE, Garmin, &copy; OpenStreetMap contributors", maxZoom:16}).addTo(map);
+map.createPane("dotsPane").style.zIndex = 650;
+
+function colorFor(v){ if(v==null) return "#d6d6d6"; let i=0; for(let k=0;k<STEPS.length;k++) if(v>=STEPS[k]) i=k; return RAMP[i]; }
+function val(t){ return species==="total" ? t.total : (t.counts[species]||0); }
+function countyValues(){ const m={}; for(const t of data.traps){ m[t.fips]=(m[t.fips]||0)+val(t); } return m; }
+
+// legend (left)
+const legend = L.control({position:"topleft"});
+legend.onAdd = () => { const d=L.DomUtil.create("div","legend"); d.id="legend"; return d; };
+legend.addTo(map);
+function drawLegend(){
+ let h=`<b>${SP[species]} count</b>`;
+ for(let i=STEPS.length-1;i>=0;i--) h+=`<div class="r"><i style="background:${RAMP[i]}"></i>${STEPS[i]}${i===STEPS.length-1?"+":""}</div>`;
+ h+=`<div class="r"><i style="background:#d6d6d6"></i>no trap</div>`;
+ h+=`<div class="sim">&#9733; LIVE - MothBox (real)<br>&#9679; Simulated trap</div>`;
+ $("legend").innerHTML=h;
+}
+
+// seeded RNG so dots stay put between refreshes
+function rng(seed){ let a=0; for(const c of seed) a=(a*31+c.charCodeAt(0))|0; return ()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}; }
+
+function popup(t){
+ const rows=Object.keys(SP_COLOR).map(s=>`<tr><td><span class="dot" style="background:${SP_COLOR[s]}"></span>${SP[s]}</td><td>${t.counts[s]||0}</td></tr>`).join("");
+ const shown=Math.min(30,dotList(t).length), more=dotList(t).length-shown;
+ return `<b>${t.simulated?"":"&#9733; "}${t.name}</b><br>${t.county} County ${t.simulated?'<span class="badge off">Simulated</span>':'<span class="badge ok">LIVE - MothBox</span>'}
+ <table>${rows}<tr class="tot"><td>Total</td><td>${t.total}</td></tr></table>
+ <span class="mut">Updated ${t.updated}${more>0?` &middot; dots: ${shown} shown, +${more} more`:""}</span>`;
+}
+function dotList(t){
+ const sps = species==="total" ? Object.keys(SP_COLOR) : [species];
+ const lists = sps.map(s=>Array(t.counts[s]||0).fill(s)), out=[];
+ for(let i=0; lists.some(l=>i<l.length); i++) for(const l of lists) if(i<l.length) out.push(l[i]);  // interleave species
+ return out;
+}
+
+function render(){
+ const cv = countyValues();
+ countyLayer.setStyle(f => { const v=cv[f.properties.fips]; return {fillColor:colorFor(v), fillOpacity:v==null?.35:.6, color:"#fff", weight:.8}; });
+ countyLayer.eachLayer(l => { const v=cv[l.feature.properties.fips]; l.bindTooltip(`${l.feature.properties.name} County: ${v==null?"no trap":v+" "+SP[species].toLowerCase()}`, {sticky:true}); });
+
+ markers.clearLayers(); dots.clearLayers();
+ for(const t of data.traps){
+  const m = t.simulated
+   ? L.circleMarker([t.lat,t.lon],{radius:7,color:"#333",weight:1.5,fillColor:"#fff",fillOpacity:.9})
+   : L.marker([t.lat,t.lon],{zIndexOffset:1000,icon:L.divIcon({className:"",html:'<div style="font-size:30px;color:#d40000;text-shadow:0 0 3px #fff,0 0 3px #fff">&#9733;</div>',iconSize:[30,30],iconAnchor:[15,18]})});
+  m.bindPopup(popup(t)).bindTooltip(t.simulated?`${t.name}`:"LIVE - MothBox").addTo(markers);
+  const r=rng(t.id), list=dotList(t).slice(0,30);
+  list.forEach(s=>{ const a=r()*2*Math.PI, d=.012+r()*.05;
+   L.circleMarker([t.lat+d*Math.sin(a), t.lon+d*Math.cos(a)*1.2],{pane:"dotsPane",radius:3.5,weight:.6,color:"#fff",fillColor:SP_COLOR[s],fillOpacity:.95})
+    .bindTooltip(`${SP[s]} &middot; ${t.simulated?t.name:"LIVE - MothBox"}`).addTo(dots); });
+ }
+ markers.addTo(map);
+ $("chDots").checked ? dots.addTo(map) : map.removeLayer(dots);
+
+ if(heat) map.removeLayer(heat), heat=null;
+ if($("chHeat").checked && L.heatLayer){
+  const mx=Math.max(1,...data.traps.map(val));
+  heat=L.heatLayer(data.traps.map(t=>[t.lat,t.lon,val(t)/mx]),{radius:55,blur:40,maxZoom:9,max:1,
+   gradient:{.15:"#3a86d1",.35:"#4cbb3f",.55:"#f2e630",.75:"#f27c22",1:"#a8101a"}}).addTo(map);
+ }
+
+ drawLegend();
+ const live=data.traps.find(t=>!t.simulated);
+ $("live").innerHTML=Object.keys(SP_COLOR).map(s=>`<tr><td><span class="dot" style="background:${SP_COLOR[s]}"></span>${SP[s]}</td><td>${live.counts[s]}</td></tr>`).join("")+`<tr class="tot"><td>Total</td><td>${live.total}</td></tr>`;
+ $("liveUpd").textContent="MothBox reading: "+live.updated;
+ $("status").innerHTML=data.live_ok?'<span class="badge ok">Pi online - live</span>':`<span class="badge off" title="${data.live_error.replace(/"/g,"'")}">Pi offline - showing last reading</span>`;
+ $("upd").textContent="Last updated "+data.generated;
+ document.querySelectorAll("#sp button").forEach(b=>b.classList.toggle("on",b.dataset.s===species));
+}
+
+async function refresh(){
+ nextAt=Date.now()+REFRESH_SECONDS*1000;
+ try{ data=await (await fetch("/api/counts")).json(); render(); loadHistory(); }
+ catch(e){ $("status").innerHTML='<span class="badge off">Dashboard server unreachable - showing last data</span>'; }
+}
+
+$("sp").innerHTML=Object.entries(SP).map(([k,v])=>`<button data-s="${k}">${v}</button>`).join("");
+$("sp").onclick=e=>{ if(e.target.dataset.s){ species=e.target.dataset.s; if(data) render(); } };
+$("chDots").onchange=$("chHeat").onchange=()=>data&&render();
+$("now").onclick=refresh;
+$("key").innerHTML=Object.keys(SP_COLOR).map(s=>`<div><span class="dot" style="background:${SP_COLOR[s]}"></span>${SP[s]}</div>`).join("");
+setInterval(()=>{ const s=Math.max(0,Math.round((nextAt-Date.now())/1000)); $("cd").textContent=`Next refresh in ${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; if(s<=0&&nextAt) refresh(); },1000);
+
+// ---------- analytics over time (/api/history) ----------
+const SPK = Object.keys(SP_COLOR);
+let hist = [];
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const hhmm = t => t.slice(11,16), day = t => t.slice(5,10);
+
+async function loadHistory(){
+ if(!data) return;
+ if(!$("aTrap").options.length)
+  $("aTrap").innerHTML = data.traps.map(t=>`<option value="${t.id}">${esc(t.simulated ? t.name : "LIVE - MothBox (real)")}</option>`).join("");
+ try{
+  const r = await (await fetch(`/api/history?trap=${encodeURIComponent($("aTrap").value)}&hours=${$("aHours").value}`)).json();
+  hist = r.rows; drawAnalytics();
+ }catch(e){ $("aTiles").innerHTML = '<span class="mut">History unavailable</span>'; }
+}
+
+function drawAnalytics(){
+ const n = hist.length;
+ if(!n){
+  $("aTiles").innerHTML = '<span class="mut">No readings recorded yet for this trap. A reading is saved every 2.5 minutes (the live trap only while the Pi is online).</span>';
+  $("aChart").innerHTML = ""; $("aLegend").innerHTML = ""; $("aTbl").innerHTML = ""; return;
+ }
+ const tot = hist.map(r=>r.total), last = hist[n-1], first = hist[0];
+ const peak = hist.reduce((a,r)=>r.total>a.total?r:a, first);
+ const avg = tot.reduce((a,b)=>a+b,0)/n, delta = last.total-first.total;
+ const top = SPK.reduce((a,s)=>{ const v=hist.reduce((x,r)=>x+r[s],0); return v>a[1]?[s,v]:a; }, ["",-1]);
+ $("aTiles").innerHTML = [
+  [last.total, "Latest total"], [peak.total, `Peak (${hhmm(peak.time)}, ${day(peak.time)})`], [avg.toFixed(1), "Average total"],
+  [(delta>0?"+":"")+delta, "Change over range"], [top[1]>0?SP[top[0]]:"-", "Most counted species"], [n, "Readings"]
+ ].map(([v,l])=>`<div class="tile"><b>${esc(v)}</b><span>${esc(l)}</span></div>`).join("");
+ $("aLegend").innerHTML = SPK.map(s=>`<span><i style="background:${SP_COLOR[s]}"></i>${SP[s]}</span>`).join("");
+
+ // line chart: one series per species, one y-axis, direct labels at the line ends
+ const W = Math.max(320, $("aChart").clientWidth), H = 190, L = 34, R = 92, T = 8, B = 22;
+ const ymax = Math.max(4, ...hist.flatMap(r=>SPK.map(s=>r[s])));
+ const step = Math.max(1, Math.ceil(ymax/4)), top4 = step*4;
+ const x = i => L + (n===1 ? (W-L-R)/2 : i*(W-L-R)/(n-1)), y = v => T + (H-T-B)*(1 - v/top4);
+ let g = "";
+ for(let v=0; v<=top4; v+=step) g += `<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="#e6e8e4"/><text x="${L-6}" y="${y(v)+4}" text-anchor="end" font-size="11" fill="#5d6762">${v}</text>`;
+ const ticks = Math.min(6, n);
+ for(let k=0; k<ticks; k++){ const i = ticks===1 ? 0 : Math.round(k*(n-1)/(ticks-1)); g += `<text x="${x(i)}" y="${H-6}" text-anchor="middle" font-size="11" fill="#5d6762">${hhmm(hist[i].time)}</text>`; }
+ // direct labels, nudged apart so they don't overlap
+ const ends = SPK.map(s=>({s, y:y(last[s])})).sort((a,b)=>a.y-b.y);
+ for(let i=1;i<ends.length;i++) if(ends[i].y-ends[i-1].y<13) ends[i].y = ends[i-1].y+13;
+ for(const s of SPK){
+  const pts = hist.map((r,i)=>`${x(i).toFixed(1)},${y(r[s]).toFixed(1)}`).join(" ");
+  g += n>1 ? `<polyline points="${pts}" fill="none" stroke="${SP_COLOR[s]}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`
+           : `<circle cx="${x(0)}" cy="${y(last[s])}" r="4" fill="${SP_COLOR[s]}" stroke="#fff" stroke-width="2"/>`;
+ }
+ for(const e of ends) g += `<text x="${W-R+8}" y="${e.y+4}" font-size="11" fill="#1d2321">${SP[e.s]} ${last[e.s]}</text>`;
+ g += `<line id="xh" y1="${T}" y2="${H-B}" stroke="#9aa39e" stroke-dasharray="3 3" visibility="hidden"/><g id="xd"></g>`;
+ $("aChart").innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Counts per species over time">${g}<rect x="${L}" y="0" width="${W-L-R}" height="${H}" fill="transparent" id="hit"/></svg><div class="tip" id="tip" hidden></div>`;
+
+ // hover: crosshair + tooltip for the nearest reading
+ const svg = $("aChart").querySelector("svg"), tip = $("tip");
+ $("hit").onmousemove = ev => {
+  const bx = svg.getBoundingClientRect(), px = (ev.clientX-bx.left)*W/bx.width;
+  const i = n===1 ? 0 : Math.max(0, Math.min(n-1, Math.round((px-L)/((W-L-R)/(n-1))))), r = hist[i];
+  $("xh").setAttribute("x1", x(i)); $("xh").setAttribute("x2", x(i)); $("xh").setAttribute("visibility","visible");
+  $("xd").innerHTML = SPK.map(s=>`<circle cx="${x(i)}" cy="${y(r[s])}" r="4" fill="${SP_COLOR[s]}" stroke="#fff" stroke-width="2"/>`).join("");
+  tip.innerHTML = `<b>${esc(r.time)}</b><br>` + SPK.map(s=>`<span class="dot" style="background:${SP_COLOR[s]}"></span>${SP[s]}: <b>${r[s]}</b>`).join("<br>") + `<br>Total: <b>${r.total}</b>`;
+  tip.hidden = false;
+  const left = x(i)*bx.width/W;
+  tip.style.left = (left > bx.width/2 ? left - tip.offsetWidth - 12 : left + 12) + "px"; tip.style.top = "4px";
+ };
+ $("hit").onmouseleave = () => { tip.hidden = true; $("xh").setAttribute("visibility","hidden"); $("xd").innerHTML = ""; };
+
+ $("aTbl").innerHTML = `<table><tr><th>Time</th>${SPK.map(s=>`<th>${SP[s]}</th>`).join("")}<th>Total</th></tr>` +
+  hist.slice().reverse().map(r=>`<tr><td>${esc(r.time)}</td>${SPK.map(s=>`<td>${r[s]}</td>`).join("")}<td>${r.total}</td></tr>`).join("") + "</table>";
+}
+
+$("aTrap").onchange = $("aHours").onchange = loadHistory;
+$("aTable").onclick = () => { const t = $("aTbl"); t.hidden = !t.hidden; $("aTable").textContent = t.hidden ? "Table view" : "Hide table"; };
+$("aHide").onclick = () => { const a = $("ana"); a.classList.toggle("min"); $("aHide").textContent = a.classList.contains("min") ? "Show" : "Hide"; map.invalidateSize(); };
+window.addEventListener("resize", () => hist.length && drawAnalytics());
+
+fetch("/nc_counties.geojson").then(r=>r.json()).then(g=>{
+ countyLayer=L.geoJSON(g).addTo(map); map.fitBounds(countyLayer.getBounds(),{padding:[10,10]}); refresh();
+});
+</script></body></html>
